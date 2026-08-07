@@ -145,6 +145,7 @@ television like other compatible media.
 
 VideoLAN:
 [libVLC](https://images.videolan.org/vlc/libvlc.html)
+
 Original VLC libretro core source:
 [krisretro/vlc-libretro-core-source](https://github.com/krisretro/vlc-libretro-core-source).
 
