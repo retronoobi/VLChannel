@@ -1,0 +1,84 @@
+name: Build VLChannel
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows-x64:
+    name: Windows x64 (UCRT64)
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            make
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-vlc
+            mingw-w64-ucrt-x86_64-winpthreads
+
+      - name: Build core
+        shell: msys2 {0}
+        run: make -B -j"$(nproc)"
+
+      - name: Verify build
+        shell: msys2 {0}
+        run: |
+          test -s vlchannel_libretro.dll
+          objdump -f vlchannel_libretro.dll | grep -q "pei-x86-64"
+          sha256sum vlchannel_libretro.dll
+
+      - name: Prepare artifact
+        shell: msys2 {0}
+        run: |
+          mkdir -p dist
+          cp vlchannel_libretro.dll dist/
+          cp vlchannel_libretro.info dist/
+          cp README.md dist/
+
+      - name: Upload Windows core
+        uses: actions/upload-artifact@v4
+        with:
+          name: VLChannel-Windows-x64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Package release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: >-
+          Compress-Archive
+          -Path "dist\*"
+          -DestinationPath "VLChannel-Windows-x64.zip"
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $asset = "VLChannel-Windows-x64.zip"
+
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $asset --clobber
+          } else {
+            gh release create $tag $asset `
+              --verify-tag `
+              --generate-notes `
+              --title "VLChannel $tag"
+          }
