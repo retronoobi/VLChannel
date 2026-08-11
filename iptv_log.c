@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
+#include <pthread.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -21,30 +22,47 @@
  * actually mattered was the order and the spacing of three events inside one
  * session. A log that cannot be measured invites being interpreted.
  */
+/* Guards the clock origin, file state, complete records and flush cadence. */
+static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
+static unsigned long long log_origin = 0;
+static unsigned since_flush = 0;
+
+/* Called with log_mutex held. */
 static unsigned long long log_now_ms(void) {
 #ifdef _WIN32
-    static unsigned long long origin = 0;
     unsigned long long now = (unsigned long long)GetTickCount64();
-    if (origin == 0) origin = now;
-    return now - origin;
+    if (log_origin == 0) log_origin = now;
+    return now - log_origin;
 #else
-    static unsigned long long origin = 0;
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     unsigned long long now =
         (unsigned long long)ts.tv_sec * 1000ull + (unsigned long long)ts.tv_nsec / 1000000ull;
-    if (origin == 0) origin = now;
-    return now - origin;
+    if (log_origin == 0) log_origin = now;
+    return now - log_origin;
 #endif
 }
 
 static FILE *log_file = NULL;
 static char log_file_path[4096] = {0};
 
+/* Called with log_mutex held. */
+static void close_log_file(void) {
+    if (log_file) {
+        fclose(log_file);
+        log_file = NULL;
+    }
+    log_file_path[0] = '\0';
+    since_flush = 0;
+}
+
 void iptv_log_open(const char *path) {
-    iptv_log_close();
-    if (!path || !path[0])
+    pthread_mutex_lock(&log_mutex);
+    close_log_file();
+    if (!path || !path[0]) {
+        pthread_mutex_unlock(&log_mutex);
         return;
+    }
 
     /*
      * Truncated on every start, not appended. A session log that answers "what
@@ -54,6 +72,7 @@ void iptv_log_open(const char *path) {
     log_file = fopen(path, "w");
     if (!log_file) {
         fprintf(stderr, "[VLChannel] Cannot open the log file %s\n", path);
+        pthread_mutex_unlock(&log_mutex);
         return;
     }
 
@@ -73,14 +92,13 @@ void iptv_log_open(const char *path) {
      * Ordinary buffering plus a periodic flush gives the same guarantee without
      * the trap.
      */
+    pthread_mutex_unlock(&log_mutex);
 }
 
 void iptv_log_close(void) {
-    if (log_file) {
-        fclose(log_file);
-        log_file = NULL;
-    }
-    log_file_path[0] = '\0';
+    pthread_mutex_lock(&log_mutex);
+    close_log_file();
+    pthread_mutex_unlock(&log_mutex);
 }
 
 const char *iptv_log_path(void) {
@@ -89,6 +107,7 @@ const char *iptv_log_path(void) {
 
 void iptv_log(const char *format, ...) {
     va_list arguments;
+    pthread_mutex_lock(&log_mutex);
     unsigned long long stamp = log_now_ms();
 
     fprintf(stderr, "[%8llu ms] ", stamp);
@@ -96,8 +115,10 @@ void iptv_log(const char *format, ...) {
     vfprintf(stderr, format, arguments);
     va_end(arguments);
 
-    if (!log_file)
+    if (!log_file) {
+        pthread_mutex_unlock(&log_mutex);
         return;
+    }
 
     fprintf(log_file, "[%8llu ms] ", stamp);
     va_start(arguments, format);
@@ -108,12 +129,11 @@ void iptv_log(const char *format, ...) {
      * Flushed every so often rather than on every line. libVLC's echo runs to
      * hundreds of thousands of lines in a session, and flushing each one turns
      * the log into a disk-bound brake on the decoder threads that produce it.
-     * The counter is written from several threads without a lock: the only
-     * consequence of a lost increment is a flush landing a few lines late.
+     * The record lock also makes the flush cadence exact.
      */
-    static unsigned since_flush = 0;
     if (++since_flush >= 64) {
         since_flush = 0;
         fflush(log_file);
     }
+    pthread_mutex_unlock(&log_mutex);
 }

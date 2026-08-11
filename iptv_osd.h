@@ -34,7 +34,8 @@ typedef enum {
  * available in both styles; loading has its own independent switch. */
 typedef enum {
     IPTV_OSD_STYLE_TV = 0,       /* yellow channel number, upper right */
-    IPTV_OSD_STYLE_CABLE_TV      /* full receiver-style banner */
+    IPTV_OSD_STYLE_CABLE_TV,     /* full receiver-style banner */
+    IPTV_OSD_STYLE_CABLE_TV_PIP  /* guide with current picture and details */
 } iptv_osd_style;
 
 void iptv_osd_set_style(iptv_osd_style style);
@@ -104,6 +105,7 @@ bool iptv_osd_visible(void);
 
 void iptv_osd_draw(
     uint32_t *pixels,
+    const uint32_t *video_pixels,
     unsigned width,
     unsigned height,
     unsigned pitch_bytes,

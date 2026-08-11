@@ -1,4 +1,5 @@
 #include "iptv_ytdlp.h"
+#include "iptv_ytdlp_command.h"
 #include "iptv_log.h"
 
 #include <pthread.h>
@@ -14,17 +15,15 @@
 #define YT_PATH_MAX 4096
 #define YT_TIMEOUT_MS 30000
 
-/*
- * The command line holds the executable path, the format selector, the video
- * address and the flags, so it is sized from those and not guessed. It was
- * guessed once - URL_MAX + 512 - and the compiler said so: the same shape of
- * mistake as the 1536 byte channel URL, caught this time before it shipped.
- */
-#define YT_CMD_MAX (YT_PATH_MAX * 2 + YT_URL_MAX + 512)
-
 /* The directory plus a file name, so it cannot be the same size as the
  * directory. The compiler pointed this one out too. */
 #define YT_EXE_MAX (YT_PATH_MAX + 32)
+
+/*
+ * Quoting can double backslashes and adds delimiters around every argument.
+ * Size for that worst case, not just for the unescaped input strings.
+ */
+#define YT_CMD_MAX (YT_EXE_MAX * 4u + YT_URL_MAX * 2u + 512u)
 
 static char directory[YT_PATH_MAX] = {0};
 static char executable[YT_EXE_MAX] = {0};
@@ -133,16 +132,12 @@ static bool run_ytdlp(const char *url, const char *cookies,
     SetHandleInformation(pipe_rd, HANDLE_FLAG_INHERIT, 0);
 
     char cmd[YT_CMD_MAX];
-    if (cookies) {
-        snprintf(cmd, sizeof(cmd),
-                 "\"%s\" -f \"%s\" --cookies \"%s\" --get-url "
-                 "--no-playlist --no-warnings \"%s\"",
-                 executable, IPTV_YT_FORMAT, cookies, url);
-    } else {
-        snprintf(cmd, sizeof(cmd),
-                 "\"%s\" -f \"%s\" --get-url --no-playlist "
-                 "--no-warnings \"%s\"",
-                 executable, IPTV_YT_FORMAT, url);
+    if (!iptv_ytdlp_build_windows_command(
+            cmd, sizeof(cmd), executable, IPTV_YT_FORMAT, cookies, url)) {
+        CloseHandle(pipe_wr);
+        CloseHandle(pipe_rd);
+        iptv_log("[VLChannel] yt-dlp command line is too long or invalid\n");
+        return false;
     }
 
     STARTUPINFOA si = {0};
@@ -154,7 +149,9 @@ static bool run_ytdlp(const char *url, const char *cookies,
     si.hStdInput = NULL;
 
     PROCESS_INFORMATION pi = {0};
-    BOOL ok = CreateProcessA(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW,
+    /* Supplying lpApplicationName separately removes executable-path parsing
+     * from the command line. argv[0] remains present in cmd for the child. */
+    BOOL ok = CreateProcessA(executable, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW,
                              NULL, NULL, &si, &pi);
     CloseHandle(pipe_wr);
     if (!ok) {

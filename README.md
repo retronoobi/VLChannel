@@ -6,11 +6,13 @@ channel switching, a television-style on-screen display, an optional channel
 guide and schedule, stream reconnection, audio synchronization controls, and a
 clear no-signal screen for unavailable channels.
 
-The core always presents a stable 1920x1080 frame to RetroArch, independently
-of the resolution of the current stream. This keeps the picture geometry and
-OSD layout consistent when changing between channels with different source
-resolutions. Optional preprocessed `.epg` files placed beside a playlist add
-programme information to the Cable TV guide and banner.
+The core presents a stable fixed-resolution frame to RetroArch, independently
+of the resolution of the current stream. The default is 1920x1080; 1280x720 is
+available for frontends or display paths that have trouble with 1080p output.
+This keeps the picture geometry and OSD layout consistent when changing between
+channels with different source resolutions. Optional preprocessed `.epg` files
+placed beside a playlist add programme information to the Cable TV guide and
+banner.
 
 ## Installing in RetroArch
 
@@ -80,9 +82,12 @@ face-button names use a different convention.
 | **X** | Open or close the schedule | Switch to or close the schedule |
 | **Y** | Open or close the channel guide | Switch to or close the guide |
 
-The full guide and schedule are available only with the **Cable TV** OSD. The
-minimal **TV** OSD uses the same channel and reconnection controls but displays
-only the channel number.
+The full guide and schedule are available with the **Cable TV** OSD styles. The
+**Cable TV (PIP)** guide, schedule and video guide keep the playing channel in a
+picture at the top with its programme description. Long programme and channel
+names scroll inside their own heading areas, while the cursor moves independently
+through the menu below. The minimal **TV** OSD uses the same channel and
+reconnection controls but displays only the channel number.
 
 ## Core options
 
@@ -91,8 +96,9 @@ is running. The first value listed by RetroArch is the default.
 
 | Option | Default | Description |
 | --- | --- | --- |
+| **Fixed output resolution** | `1920x1080` | Selects the fixed frame sent to the frontend. `1280x720` works around the red line that EmuVR can show at the top of high-resolution core output. Close and reload the content after changing it. |
 | **Picture width** | `100%` | Shrinks the active picture horizontally to compensate for display or converter overscan. Changing it reopens the channel. |
-| **Picture height** | `100%` | Shrinks the active picture vertically while keeping the core's 1920x1080 output. Changing it reopens the channel. |
+| **Picture height** | `100%` | Shrinks the active picture vertically while keeping the selected fixed output resolution. Changing it reopens the channel. |
 | **Horizontal position** | `0%` | Moves a reduced picture left or right within the output canvas. |
 | **Vertical position** | `0%` | Moves a reduced picture up or down within the output canvas. |
 | **Network and live caching (ms)** | `1500` | Sets libVLC's network and live-stream buffer. Higher values may tolerate unstable connections better, at the cost of additional latency. Changing it reopens the channel. |
@@ -106,7 +112,7 @@ is running. The first value listed by RetroArch is the default.
 | **On-screen language** | `English` | Sets the language of the guide and Cable TV banner. `auto` follows the frontend language when supported. |
 | **Channel change noise** | `50%` | Controls the volume of the short channel-change sound. This is an audio effect and is separate from Picture noise. |
 | **Cable TV banner second line** | `now and next` | Shows the current and next programme, or adds the current programme description when listing data is available. |
-| **OSD** | `TV` | `TV` displays a minimal green channel number. `Cable TV` enables the full information banner, guide, and schedule. |
+| **OSD** | `TV` | `TV` displays a minimal green channel number. `Cable TV` enables the full information banner, guide, and schedule. `Cable TV (PIP)` adds the playing picture and its description above the channel, schedule, and video menus; moving the cursor does not change either. |
 | **Loading screen** | `disabled` | Shows a loading message while a channel is being opened. |
 | **Picture noise** | `off` | Adds animated analogue-style grain to the channel picture and no-signal screen. The core OSD is drawn afterward and remains clean. |
 | **Write the full core log** | `disabled` | Writes detailed diagnostics to `system\vlchannel-core.log`. Restart the core after changing this option. |
@@ -121,6 +127,11 @@ EmuVR\RetroArch\cores\vlchannel_libretro.dll
 EmuVR\RetroArch\info\vlchannel_libretro.info
 EmuVR\RetroArch\system\vlchannel\
 ```
+
+If EmuVR shows a red line along the top edge of the television picture, select
+**Fixed output resolution > 1280x720** in the core options, then close and reload
+the content. The 1920x1080 mode remains the default for frontends without this
+problem.
 
 Open `EmuVR\Game Scanner\custom_media.txt` and add
 `vlchannel_libretro` to the media type that will contain your channel lists. For
@@ -145,7 +156,5 @@ television like other compatible media.
 
 VideoLAN:
 [libVLC](https://images.videolan.org/vlc/libvlc.html)
-
 Original VLC libretro core source:
 [krisretro/vlc-libretro-core-source](https://github.com/krisretro/vlc-libretro-core-source).
-

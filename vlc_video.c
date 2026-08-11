@@ -168,11 +168,16 @@ static unsigned setup_format_cb(
     unsigned h = output_height;
     pthread_mutex_unlock(&vbuf_mutex);
 
+    pthread_mutex_lock(&core.mutex);
+    unsigned previous_width = core.video_width;
+    unsigned previous_height = core.video_height;
+    pthread_mutex_unlock(&core.mutex);
+
     fprintf(stderr,
             "[VLC] setup_format_cb: source %ux%u -> output area %ux%u "
             "(was %ux%u)\n",
             source_w, source_h, w, h,
-            core.video_width, core.video_height);
+            previous_width, previous_height);
 
     if (source_w == 0 || source_h == 0) {
         fprintf(stderr, "[VLC] setup_format_cb: rejecting degenerate source\n");

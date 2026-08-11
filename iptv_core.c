@@ -13,7 +13,8 @@
  *   - the vmem/amem callbacks and the triple buffered frame store;
  *   - the PCM ring buffer, its prebuffer and its fade in and out;
  *   - the frontend pause watchdog;
- *   - presenting every source inside a fixed 1920x1080 output canvas.
+ *   - presenting every source inside a fixed output canvas, 1920x1080 by
+ *     default or 1280x720 for frontends that have trouble with 1080p.
  *
  * What is new here:
  *
@@ -33,6 +34,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <math.h>
 #include <ctype.h>
@@ -95,23 +97,27 @@ static bool prev_guide = false, prev_sched = false;
 static bool runtime_options_dirty = true;
 
 /*
- * The vmem output asks libVLC to convert and scale every source directly to
- * 1920x1080. The picture handed to libretro therefore keeps one exact OSD
- * coordinate system without a second scalar RGB scaling pass in this core.
+ * The vmem output asks libVLC to convert and scale every source directly to the
+ * selected fixed canvas. The picture handed to libretro therefore keeps one
+ * exact OSD coordinate system without a second scalar RGB scaling pass in this
+ * core. MAX_W/MAX_H remain the allocation ceiling; the active canvas can be
+ * smaller without allocating a second set of buffers.
  *
  * Two canvases are intentional: the clean one holds the stretched picture,
  * while the composed one is a disposable copy on which the OSD is drawn. This
  * prevents a static frame from accumulating the overlay each run.
  */
-#define OUTPUT_WIDTH  MAX_W
-#define OUTPUT_HEIGHT MAX_H
-#define OUTPUT_PITCH  (OUTPUT_WIDTH * (unsigned)sizeof(uint32_t))
+#define OUTPUT_MAX_WIDTH  MAX_W
+#define OUTPUT_MAX_HEIGHT MAX_H
 
 static uint32_t *osd_clean = NULL;
 static uint32_t *osd_composed = NULL;
 static float output_content_aspect = 16.0f / 9.0f;
-static unsigned output_view_width = OUTPUT_WIDTH;
-static unsigned output_view_height = OUTPUT_HEIGHT;
+static unsigned output_width = OUTPUT_MAX_WIDTH;
+static unsigned output_height = OUTPUT_MAX_HEIGHT;
+static unsigned output_pitch = OUTPUT_MAX_WIDTH * (unsigned)sizeof(uint32_t);
+static unsigned output_view_width = OUTPUT_MAX_WIDTH;
+static unsigned output_view_height = OUTPUT_MAX_HEIGHT;
 static int output_shift_x_percent = 0;
 static int output_shift_y_percent = 0;
 static bool output_layout_dirty = true;
@@ -121,6 +127,8 @@ static unsigned output_last_source_width = 0;
 static unsigned output_last_source_height = 0;
 static bool no_signal_active = false;
 static bool no_signal_frame_ready = false;
+static bool output_resolution_initialised = false;
+static bool output_resolution_reload_notice_shown = false;
 
 static libvlc_state_t last_reported_state = libvlc_NothingSpecial;
 
@@ -138,7 +146,7 @@ static uint32_t opening_frames = 0;
  * log_cb. A live playlist is meant to be reloaded now and then; dozens of times
  * before the first segment means the server is serving a frozen one.
  */
-static unsigned playlist_reloads = 0;
+static atomic_uint playlist_reloads = 0;
 static bool frozen_playlist_reported = false;
 
 /*
@@ -169,6 +177,9 @@ static bool frontend_paused_vlc = false;
 static uint64_t frontend_last_run_ms = 0;
 static uint64_t frontend_run_generation = 0;
 static uint64_t frontend_pause_started_ms = 0;
+/* Published under frontend_pause_mutex and kept alive until the watchdog has
+ * been joined, so that thread never reads core.mp concurrently. */
+static libvlc_media_player_t *frontend_pause_player = NULL;
 
 /*
  * How long the frontend may hold the core paused before the channel is
@@ -252,7 +263,7 @@ static void *frontend_pause_watchdog(void *unused) {
             now - frontend_last_run_ms >= 300) {
             frontend_pause_in_progress = true;
             captured_generation = frontend_run_generation;
-            mp = core.mp;
+            mp = frontend_pause_player;
             should_pause = mp != NULL;
         }
         pthread_mutex_unlock(&frontend_pause_mutex);
@@ -390,7 +401,7 @@ static void note_frontend_run(libvlc_media_player_t *mp) {
 
 static bool ensure_output_buffers(void) {
     static bool allocation_error_reported = false;
-    size_t pixels = (size_t)OUTPUT_WIDTH * OUTPUT_HEIGHT;
+    size_t pixels = (size_t)OUTPUT_MAX_WIDTH * OUTPUT_MAX_HEIGHT;
 
     if (!osd_clean)
         osd_clean = (uint32_t *)calloc(pixels, sizeof(uint32_t));
@@ -399,7 +410,7 @@ static bool ensure_output_buffers(void) {
 
     if (!osd_clean || !osd_composed) {
         if (!allocation_error_reported) {
-            iptv_log("[VLChannel] Could not allocate the 1920x1080 output "
+            iptv_log("[VLChannel] Could not allocate the maximum-sized output "
                      "canvases\n");
             allocation_error_reported = true;
         }
@@ -420,9 +431,58 @@ static void reset_output_picture(void) {
     signal_noise_frame = 0;
 }
 
+/*
+ * Selects the canvas before the frontend asks for AV information.
+ *
+ * Geometry is deliberately not changed while content is running. EmuVR is the
+ * reason the 720p choice exists, and changing the video pipeline underneath a
+ * running EmuVR session would trade a cosmetic workaround for a much less
+ * predictable failure. A changed option is therefore picked up by reloading
+ * the content, when RetroArch asks for one fresh, stable geometry.
+ */
+static void apply_output_resolution(void) {
+    const char *choice = option_value("vlchannel_output_resolution",
+                                      "1920x1080");
+    unsigned width = strstr(choice, "1280") ? 1280u : 1920u;
+    unsigned height = width == 1280u ? 720u : 1080u;
+    bool changed = width != output_width || height != output_height;
+
+    if (changed) {
+        output_width = width;
+        output_height = height;
+        output_pitch = width * (unsigned)sizeof(uint32_t);
+        output_view_width = width;
+        output_view_height = height;
+        reset_output_picture();
+    }
+
+    if (!output_resolution_initialised || changed)
+        note("Fixed output resolution: %ux%u", output_width, output_height);
+
+    output_resolution_initialised = true;
+    output_resolution_reload_notice_shown = false;
+}
+
+static void report_pending_output_resolution(void) {
+    const char *choice = option_value("vlchannel_output_resolution",
+                                      "1920x1080");
+    unsigned requested_width = strstr(choice, "1280") ? 1280u : 1920u;
+
+    if (requested_width == output_width) {
+        output_resolution_reload_notice_shown = false;
+        return;
+    }
+    if (output_resolution_reload_notice_shown)
+        return;
+
+    output_resolution_reload_notice_shown = true;
+    note("Fixed output resolution changed to %s; close and reload the content "
+         "to apply it", requested_width == 1280u ? "1280x720" : "1920x1080");
+}
+
 /* Reads the adjustable safe area. Size changes are returned to the caller
  * because libVLC must renegotiate its vmem picture; position changes only move
- * that picture inside the fixed 1920x1080 canvas. */
+ * that picture inside the selected fixed canvas. */
 static bool apply_output_layout(void) {
     int width_percent = atoi(option_value("vlchannel_picture_width", "100%"));
     int height_percent = atoi(option_value("vlchannel_picture_height", "100%"));
@@ -438,8 +498,8 @@ static bool apply_output_layout(void) {
     if (shift_y < -5) shift_y = -5;
     if (shift_y > 5) shift_y = 5;
 
-    unsigned width = ((OUTPUT_WIDTH * (unsigned)width_percent) / 100u) & ~1u;
-    unsigned height = ((OUTPUT_HEIGHT * (unsigned)height_percent) / 100u) & ~1u;
+    unsigned width = ((output_width * (unsigned)width_percent) / 100u) & ~1u;
+    unsigned height = ((output_height * (unsigned)height_percent) / 100u) & ~1u;
     bool size_changed = width != output_view_width ||
                         height != output_view_height;
     bool layout_changed = size_changed || shift_x != output_shift_x_percent ||
@@ -474,16 +534,16 @@ static void set_no_signal(bool active) {
 /*
  * At 100% this keeps the established EmuVR behaviour and fills the canvas.
  * Smaller values leave a black safe area for displays or converters with
- * overscan, without changing the 1920x1080 geometry reported to the frontend.
+ * overscan, without changing the selected geometry reported to the frontend.
  */
 static void output_viewport(
     float aspect, unsigned *x, unsigned *y, unsigned *width, unsigned *height
 ) {
     (void)aspect;
-    int max_x = (int)(OUTPUT_WIDTH - output_view_width);
-    int max_y = (int)(OUTPUT_HEIGHT - output_view_height);
-    int pos_x = max_x / 2 + ((int)OUTPUT_WIDTH * output_shift_x_percent) / 100;
-    int pos_y = max_y / 2 + ((int)OUTPUT_HEIGHT * output_shift_y_percent) / 100;
+    int max_x = (int)(output_width - output_view_width);
+    int max_y = (int)(output_height - output_view_height);
+    int pos_x = max_x / 2 + ((int)output_width * output_shift_x_percent) / 100;
+    int pos_y = max_y / 2 + ((int)output_height * output_shift_y_percent) / 100;
     if (pos_x < 0) pos_x = 0;
     if (pos_x > max_x) pos_x = max_x;
     if (pos_y < 0) pos_y = 0;
@@ -520,9 +580,10 @@ static unsigned blend_channel(unsigned a, unsigned b, unsigned fraction) {
 }
 
 /*
- * Normally vmem has already produced 1920x1080 and this takes the direct-copy
- * path. The scaler remains as a defensive fallback for a runtime that ignores
- * the requested vmem geometry or renegotiates an unexpected format.
+ * Normally vmem has already produced the selected canvas size and this takes
+ * the direct-copy path. The scaler remains as a defensive fallback for a
+ * runtime that ignores the requested vmem geometry or renegotiates an
+ * unexpected format.
  */
 static void scale_frame_to_output(
     const uint32_t *source, unsigned source_width, unsigned source_height,
@@ -532,22 +593,22 @@ static void scale_frame_to_output(
     output_viewport(output_content_aspect, &dst_x, &dst_y,
                     &dst_width, &dst_height);
 
-    memset(osd_clean, 0, (size_t)OUTPUT_PITCH * OUTPUT_HEIGHT);
+    memset(osd_clean, 0, (size_t)output_pitch * output_height);
 
     if (source_width == dst_width && source_height == dst_height) {
         for (unsigned y = 0; y < dst_height; y++) {
             const uint8_t *src_row = (const uint8_t *)source +
                                      (size_t)y * source_pitch;
             uint32_t *dst_row = osd_clean +
-                                (size_t)(dst_y + y) * OUTPUT_WIDTH + dst_x;
+                                (size_t)(dst_y + y) * output_width + dst_x;
             memcpy(dst_row, src_row, (size_t)dst_width * sizeof(uint32_t));
         }
         return;
     }
 
-    static unsigned x0[OUTPUT_WIDTH];
-    static unsigned x1[OUTPUT_WIDTH];
-    static unsigned xf[OUTPUT_WIDTH];
+    static unsigned x0[OUTPUT_MAX_WIDTH];
+    static unsigned x1[OUTPUT_MAX_WIDTH];
+    static unsigned xf[OUTPUT_MAX_WIDTH];
 
     for (unsigned x = 0; x < dst_width; x++) {
         uint64_t position = dst_width > 1
@@ -570,7 +631,7 @@ static void scale_frame_to_output(
         const uint32_t *row1 = (const uint32_t *)
             ((const uint8_t *)source + (size_t)y1 * source_pitch);
         uint32_t *dst = osd_clean +
-                        (size_t)(dst_y + y) * OUTPUT_WIDTH + dst_x;
+                        (size_t)(dst_y + y) * output_width + dst_x;
 
         for (unsigned x = 0; x < dst_width; x++) {
             uint32_t p00 = row0[x0[x]], p10 = row0[x1[x]];
@@ -600,17 +661,17 @@ static void apply_signal_noise(void) {
     unsigned x, y, width, height;
     output_viewport(output_content_aspect, &x, &y, &width, &height);
 
-    if (x != 0 || y != 0 || width != OUTPUT_WIDTH || height != OUTPUT_HEIGHT)
+    if (x != 0 || y != 0 || width != output_width || height != output_height)
         memcpy(osd_composed, osd_clean,
-               (size_t)OUTPUT_PITCH * OUTPUT_HEIGHT);
+               (size_t)output_pitch * output_height);
 
     uint32_t state = 0x9e3779b9U ^
                      (++signal_noise_frame * 747796405U);
     for (unsigned row = 0; row < height; row++) {
         const uint32_t *src = osd_clean +
-                              (size_t)(y + row) * OUTPUT_WIDTH + x;
+                              (size_t)(y + row) * output_width + x;
         uint32_t *dst = osd_composed +
-                        (size_t)(y + row) * OUTPUT_WIDTH + x;
+                        (size_t)(y + row) * output_width + x;
         for (unsigned column = 0; column < width; column++) {
             state = state * 1664525U + 1013904223U;
             unsigned factor = signal_noise_factor[state >> 24];
@@ -629,15 +690,16 @@ static uint32_t *compose_output(bool draw_osd, bool add_noise) {
         apply_signal_noise();
     else
         memcpy(osd_composed, osd_clean,
-               (size_t)OUTPUT_PITCH * OUTPUT_HEIGHT);
+               (size_t)output_pitch * output_height);
 
     if (!draw_osd)
         return osd_composed;
 
     unsigned x, y, width, height;
     output_viewport(output_content_aspect, &x, &y, &width, &height);
-    uint32_t *view = osd_composed + (size_t)y * OUTPUT_WIDTH + x;
-    iptv_osd_draw(view, width, height, OUTPUT_PITCH,
+    uint32_t *view = osd_composed + (size_t)y * output_width + x;
+    const uint32_t *clean_view = osd_clean + (size_t)y * output_width + x;
+    iptv_osd_draw(view, clean_view, width, height, output_pitch,
                   &playlist, current_channel);
     return osd_composed;
 }
@@ -664,9 +726,9 @@ static void submit_current_video_frame(void) {
             unsigned x, y, view_width, view_height;
             output_viewport(output_content_aspect, &x, &y,
                             &view_width, &view_height);
-            memset(osd_clean, 0, (size_t)OUTPUT_PITCH * OUTPUT_HEIGHT);
-            uint32_t *view = osd_clean + (size_t)y * OUTPUT_WIDTH + x;
-            iptv_osd_draw_no_signal(view, view_width, view_height, OUTPUT_PITCH);
+            memset(osd_clean, 0, (size_t)output_pitch * output_height);
+            uint32_t *view = osd_clean + (size_t)y * output_width + x;
+            iptv_osd_draw_no_signal(view, view_width, view_height, output_pitch);
             no_signal_frame_ready = true;
             output_clear_pending = false;
         }
@@ -681,7 +743,7 @@ static void submit_current_video_frame(void) {
         output_layout_dirty = false;
         output_clear_pending = false;
     } else if (!have_frame && output_clear_pending) {
-        memset(osd_clean, 0, (size_t)OUTPUT_PITCH * OUTPUT_HEIGHT);
+        memset(osd_clean, 0, (size_t)output_pitch * output_height);
         output_clear_pending = false;
     }
 
@@ -690,7 +752,7 @@ static void submit_current_video_frame(void) {
     uint32_t *output = (draw_osd || add_noise)
         ? compose_output(draw_osd, add_noise)
         : osd_clean;
-    video_cb(output, OUTPUT_WIDTH, OUTPUT_HEIGHT, OUTPUT_PITCH);
+    video_cb(output, output_width, output_height, output_pitch);
 }
 
 /*
@@ -698,9 +760,9 @@ static void submit_current_video_frame(void) {
  *
  * "default" means the stream's own shape: pixel size times the sample aspect
  * ratio libVLC reported. Anything else is an explicit override like "16:9".
- * The final picture is deliberately stretched to fill 1920x1080. The frontend
- * geometry never changes after load, which keeps both the OSD coordinate system
- * and the libretro video pipeline stable between channels.
+ * The final picture is deliberately stretched to fill the selected canvas. The
+ * frontend geometry never changes after load, which keeps both the OSD
+ * coordinate system and the libretro video pipeline stable between channels.
  */
 static void notify_geometry(const char *aspect_str) {
     if (!aspect_str)
@@ -804,7 +866,8 @@ static void log_cb(
      * where the channel state is known.
      */
     if (strncmp(msg, "Updated playlist ID", 19) == 0)
-        playlist_reloads++;
+        atomic_fetch_add_explicit(&playlist_reloads, 1u,
+                                  memory_order_relaxed);
 
     if (strstr(msg, "original format sz") != NULL) {
         int sar_num = 0, sar_den = 0;
@@ -970,6 +1033,9 @@ static bool open_channel_from(int index, const char *reason,
         }
         vlc_video_setup_callbacks(core.mp);
         vlc_audio_setup_callbacks(core.mp);
+        pthread_mutex_lock(&frontend_pause_mutex);
+        frontend_pause_player = core.mp;
+        pthread_mutex_unlock(&frontend_pause_mutex);
     } else {
         /*
          * The media player is created once and reused for every channel: only
@@ -1053,7 +1119,7 @@ static bool open_channel_from(int index, const char *reason,
     core.transition_timeout_frames = (uint32_t)open_timeout_s * 60u;
     pthread_mutex_unlock(&core.mutex);
     opening_frames = 0;
-    playlist_reloads = 0;
+    atomic_store_explicit(&playlist_reloads, 0u, memory_order_relaxed);
     frozen_playlist_reported = false;
     iptv_seq_opening();          /* nothing has played on this channel yet */
 
@@ -1261,6 +1327,8 @@ static void retry_audio_delay(void) {
 RETRO_API void retro_set_environment(retro_environment_t cb) {
     environ_cb = cb;
     static const struct retro_variable vars[] = {
+        { "vlchannel_output_resolution",
+          "Fixed output resolution (reload content); 1920x1080|1280x720" },
         { "vlchannel_picture_width",
           "Picture width (reopens the channel); "
           "100%|80%|82%|84%|86%|88%|90%|92%|94%|96%|98%" },
@@ -1337,7 +1405,7 @@ RETRO_API void retro_set_environment(retro_environment_t cb) {
           "Cable TV banner second line (needs a programme listing); "
           "now and next|now, description and next" },
         { "vlchannel_osd",
-          "OSD; TV|Cable TV" },
+          "OSD; TV|Cable TV|Cable TV (PIP)" },
         { "vlchannel_loading_osd",
           "Loading screen; disabled|enabled" },
         { "vlchannel_signal_noise",
@@ -1397,6 +1465,7 @@ void retro_init(void) {
     }
 
     note("Core build: %s %s", __DATE__, __TIME__);
+    apply_output_resolution();
     apply_language();
     apply_zap_volume();
     apply_osd_style();
@@ -1412,6 +1481,7 @@ void retro_init(void) {
     frontend_last_run_ms = 0;
     frontend_run_generation = 0;
     frontend_pause_started_ms = 0;
+    frontend_pause_player = NULL;
     pthread_mutex_unlock(&frontend_pause_mutex);
 
     frontend_pause_thread_started =
@@ -1580,8 +1650,8 @@ void retro_init(void) {
     core.video_height = 0;
     core.video_pitch = 0;
     core.sample_accum_frac = 0.0;
-    core.max_width = MAX_W;
-    core.max_height = MAX_H;
+    core.max_width = output_width;
+    core.max_height = output_height;
     core.audio_mute_frames = 0;
     core.audio_prebuffering = true;
     core.audio_fade_in_frames = 0;
@@ -1651,6 +1721,7 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
         note("Content path resolved: %s -> %s", info->path, playlist_path);
 
     /* Before the list is read, because the rewriting happens as it is read. */
+    apply_output_resolution();
     apply_output_layout();
     apply_youtube_proxy();
 
@@ -1956,7 +2027,9 @@ static void apply_osd_style(void) {
     static int previous = -1;
 
     const char *choice = option_value("vlchannel_osd", "TV");
-    iptv_osd_style style = strcmp(choice, "Cable TV") == 0
+    iptv_osd_style style = strstr(choice, "PIP")
+                               ? IPTV_OSD_STYLE_CABLE_TV_PIP
+                           : strcmp(choice, "Cable TV") == 0
                                ? IPTV_OSD_STYLE_CABLE_TV
                                : IPTV_OSD_STYLE_TV;
 
@@ -1964,7 +2037,10 @@ static void apply_osd_style(void) {
         return;
     previous = (int)style;
     iptv_osd_set_style(style);
-    note("OSD style: %s", style == IPTV_OSD_STYLE_TV ? "TV" : "Cable TV");
+    note("OSD style: %s",
+         style == IPTV_OSD_STYLE_TV ? "TV"
+       : style == IPTV_OSD_STYLE_CABLE_TV_PIP ? "Cable TV (PIP)"
+                                               : "Cable TV");
 }
 
 /*
@@ -2004,6 +2080,7 @@ static void apply_runtime_options(void) {
     apply_zap_volume();
     apply_osd_style();
     apply_banner_info();
+    report_pending_output_resolution();
     if (apply_output_layout() && current_channel >= 0) {
         iptv_log("[VLChannel] Picture size changed; reopening the channel\n");
         request_reload("picture size changed");
@@ -2630,9 +2707,13 @@ RETRO_API void retro_run(void) {
      */
     if (core.transitioning && resolving_channel < 0) {
         pthread_mutex_lock(&core.mutex);
-        bool geometry_known = (core.video_width > 0 && core.video_height > 0);
+        unsigned negotiated_width = core.video_width;
+        unsigned negotiated_height = core.video_height;
+        bool geometry_known = negotiated_width > 0 && negotiated_height > 0;
         pthread_mutex_unlock(&core.mutex);
         bool ready = geometry_known && vlc_video_has_frame();
+        unsigned reload_count = atomic_load_explicit(
+            &playlist_reloads, memory_order_relaxed);
 
         opening_frames++;
 
@@ -2643,14 +2724,14 @@ RETRO_API void retro_run(void) {
          * and the point is to replace a silent black screen with a sentence
          * that names the cause.
          */
-        if (!ready && !frozen_playlist_reported && playlist_reloads > 20) {
+        if (!ready && !frozen_playlist_reported && reload_count > 20) {
             frozen_playlist_reported = true;
             note("This playlist has been reloaded %u times without a single "
                  "segment being fetched. Open the same URL in VLC desktop "
                  "before blaming the server: the first channel that produced "
                  "this pattern played perfectly there, and the cause was an "
                  "option this core was passing to libVLC, not the stream.",
-                 playlist_reloads);
+                 reload_count);
         }
 
         if (!ready && opening_frames % 180 == 0)
@@ -2668,8 +2749,8 @@ RETRO_API void retro_run(void) {
                  */
                 notify_geometry(NULL);
                 apply_audio_delay("channel ready");
-                note("Channel ready: %ux%u", core.video_width,
-                     core.video_height);
+                note("Channel ready: %ux%u", negotiated_width,
+                     negotiated_height);
             } else {
                 /*
                  * Stop, do not just give up on the picture. libVLC keeps
@@ -3076,10 +3157,10 @@ RETRO_API void retro_run(void) {
 RETRO_API void retro_get_system_av_info(struct retro_system_av_info *info) {
     double fps = (core.video_fps > 0) ? core.video_fps : 60.0;
 
-    info->geometry.base_width   = OUTPUT_WIDTH;
-    info->geometry.base_height  = OUTPUT_HEIGHT;
-    info->geometry.max_width    = OUTPUT_WIDTH;
-    info->geometry.max_height   = OUTPUT_HEIGHT;
+    info->geometry.base_width   = output_width;
+    info->geometry.base_height  = output_height;
+    info->geometry.max_width    = output_width;
+    info->geometry.max_height   = output_height;
     info->geometry.aspect_ratio = 16.0f / 9.0f;
     info->timing.fps            = fps;
     info->timing.sample_rate    = AUDIO_TARGET_RATE;
@@ -3090,7 +3171,7 @@ RETRO_API void retro_get_system_av_info(struct retro_system_av_info *info) {
 
 RETRO_API void retro_get_system_info(struct retro_system_info *i) {
     static char library_name[]    = "VLChannel";
-    static char library_version[] = "1.0";
+    static char library_version[] = "1.1";
     /* Both extensions hold the same thing: a channel list, or an HLS manifest
      * that the reader detects and opens as a single stream. */
     static char valid_extensions[] = "m3u|m3u8";
@@ -3134,6 +3215,10 @@ RETRO_API void retro_deinit(void) {
         frontend_pause_thread_started = false;
     }
 
+    pthread_mutex_lock(&frontend_pause_mutex);
+    frontend_pause_player = NULL;
+    pthread_mutex_unlock(&frontend_pause_mutex);
+
     if (core.mp) {
         libvlc_media_player_stop(core.mp);
         libvlc_media_player_release(core.mp);
@@ -3155,6 +3240,8 @@ RETRO_API void retro_deinit(void) {
     reset_output_picture();
 
     pthread_mutex_destroy(&core.mutex);
+    output_resolution_initialised = false;
+    output_resolution_reload_notice_shown = false;
     iptv_log_close();
 }
 

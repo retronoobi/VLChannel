@@ -340,6 +340,11 @@ typedef enum {
      * each walks its own text at its own length. */
     SCROLL_SCHED_CHANNEL,
     SCROLL_SCHED_PROGRAMME,
+    /* The PIP header belongs to the channel being watched, not to the row the
+     * viewer is browsing. Its two labels therefore keep independent positions
+     * and are not reset when the cursor moves in the lower half. */
+    SCROLL_PIP_PROGRAMME,
+    SCROLL_PIP_CHANNEL,
     SCROLL_SLOTS
 } scroll_slot;
 
@@ -368,6 +373,13 @@ static uint32_t text_hash(const char *text) {
 
 static void reset_scroll(void) {
     memset(scroller, 0, sizeof(scroller));
+}
+
+static void reset_schedule_scroll(void) {
+    memset(&scroller[SCROLL_SCHED_CHANNEL], 0,
+           sizeof(scroller[SCROLL_SCHED_CHANNEL]));
+    memset(&scroller[SCROLL_SCHED_PROGRAMME], 0,
+           sizeof(scroller[SCROLL_SCHED_PROGRAMME]));
 }
 
 /*
@@ -453,6 +465,65 @@ static void draw_text_shadowed(
 ) {
     draw_text(s, x + scale, y + scale, text, scale, COLOUR_TEXT_DARK, max_width);
     draw_text(s, x, y, text, scale, colour, max_width);
+}
+
+/* Word-wrapped prose for the PIP information panel. Programme descriptions
+ * are capped by the EPG producer, so one fixed line buffer holds any useful
+ * row without imposing a new limit on the stored listing itself. */
+static void draw_text_wrapped(
+    const surface *s, int x, int y, const char *text, int scale,
+    uint32_t colour, int max_width, int max_lines
+) {
+    if (!text || !text[0] || max_width <= 0 || max_lines <= 0)
+        return;
+
+    char line[512] = {0};
+    size_t used = 0;
+    int drawn = 0;
+    int line_step = IPTV_FONT_HEIGHT * scale + scale;
+    const char *at = text;
+
+    while (*at && drawn < max_lines) {
+        while (*at == ' ' || *at == '\t')
+            at++;
+        if (!*at)
+            break;
+
+        const char *word = at;
+        while (*at && *at != ' ' && *at != '\t')
+            at++;
+        size_t word_len = (size_t)(at - word);
+        if (word_len >= sizeof(line))
+            word_len = sizeof(line) - 1;
+
+        size_t old_used = used;
+        if (used > 0 && used + 1 < sizeof(line))
+            line[used++] = ' ';
+        size_t room = sizeof(line) - 1 - used;
+        size_t copy = word_len < room ? word_len : room;
+        memcpy(line + used, word, copy);
+        used += copy;
+        line[used] = '\0';
+
+        if (old_used > 0 && text_width(line, scale) > max_width) {
+            line[old_used] = '\0';
+            draw_text(s, x, y + drawn * line_step, line, scale,
+                      colour, max_width);
+            drawn++;
+            if (drawn >= max_lines)
+                return;
+
+            copy = word_len < sizeof(line) - 1
+                       ? word_len : sizeof(line) - 1;
+            memcpy(line, word, copy);
+            used = copy;
+            line[used] = '\0';
+        }
+    }
+
+    if (used > 0 && drawn < max_lines)
+        draw_text(s, x, y + drawn * line_step, line, scale,
+                  colour, max_width);
 }
 
 /*
@@ -861,7 +932,7 @@ bool iptv_osd_schedule_open(void) {
 }
 
 void iptv_osd_open_schedule(const iptv_playlist *playlist, int current_channel) {
-    if (osd_style != IPTV_OSD_STYLE_CABLE_TV ||
+    if (osd_style == IPTV_OSD_STYLE_TV ||
         !playlist || playlist->count == 0)
         return;
 
@@ -879,7 +950,7 @@ void iptv_osd_open_schedule(const iptv_playlist *playlist, int current_channel) 
 }
 
 void iptv_osd_open_guide(const iptv_playlist *playlist, int current_channel) {
-    if (osd_style != IPTV_OSD_STYLE_CABLE_TV ||
+    if (osd_style == IPTV_OSD_STYLE_TV ||
         !playlist || playlist->count == 0)
         return;
 
@@ -966,7 +1037,7 @@ int iptv_osd_key_pressed(iptv_osd_key key, const iptv_playlist *playlist) {
         int chosen = schedule_key(key, playlist);
         if (key == IPTV_OSD_UP || key == IPTV_OSD_DOWN ||
             key == IPTV_OSD_LEFT || key == IPTV_OSD_RIGHT)
-            reset_scroll();      /* the walking label belongs to the old row */
+            reset_schedule_scroll(); /* selected-row labels belong to old row */
         return chosen;
     }
 
@@ -1207,8 +1278,9 @@ static int scroll_to_show(int cursor, int scroll, int visible) {
     return scroll < 0 ? 0 : scroll;
 }
 
-static void draw_guide(
-    const surface *s, const iptv_playlist *playlist, int current_channel
+static void draw_guide_layout(
+    const surface *s, const iptv_playlist *playlist, int current_channel,
+    bool fill_surface
 ) {
     /*
      * A list of nothing but videos calls itself a video guide. Everything below
@@ -1239,7 +1311,7 @@ static void draw_guide(
         line = IPTV_FONT_HEIGHT * scale;
         row_height = line + pad;
 
-        int margin = pad * 3;
+        int margin = fill_surface ? 0 : pad * 3;
         panel_x = margin;
         panel_y = margin;
         panel_w = (int)s->width - margin * 2;
@@ -1449,6 +1521,142 @@ static void draw_guide(
                   position, scale, COLOUR_SELECTED, 0);
 }
 
+static void draw_guide(
+    const surface *s, const iptv_playlist *playlist, int current_channel
+) {
+    draw_guide_layout(s, playlist, current_channel, false);
+}
+
+/* Scales the clean playing picture into the PIP. The source is separate from
+ * the composed OSD frame, so painting panels cannot feed back into later
+ * samples and the picture remains tied to the playing channel. */
+static void draw_pip_picture(
+    const surface *s, const uint32_t *video_pixels, unsigned video_stride,
+    int x, int y, int width, int height
+) {
+    if (!video_pixels || video_stride == 0 || width <= 0 || height <= 0)
+        return;
+
+    for (int row = 0; row < height; row++) {
+        unsigned source_y = (unsigned)(((uint64_t)(row * 2 + 1) * s->height) /
+                                       ((uint64_t)height * 2u));
+        if (source_y >= s->height)
+            source_y = s->height - 1;
+        const uint32_t *source = video_pixels + (size_t)source_y * video_stride;
+        uint32_t *target = s->pixels + (size_t)(y + row) * s->stride + x;
+
+        for (int column = 0; column < width; column++) {
+            unsigned source_x =
+                (unsigned)(((uint64_t)(column * 2 + 1) * s->width) /
+                           ((uint64_t)width * 2u));
+            if (source_x >= s->width)
+                source_x = s->width - 1;
+            target[column] = source[source_x];
+        }
+    }
+}
+
+/* Draws the part inspired by the reference receiver: current picture on the
+ * left, current programme and channel on the right, with no time-grid bar.
+ * Every lookup uses current_channel, never the guide cursor. */
+static int draw_pip_header(
+    const surface *s, const uint32_t *video_pixels, unsigned video_stride,
+    const iptv_playlist *playlist, int current_channel
+) {
+    int scale = scale_for(s->height);
+    int margin = 3 * scale;
+    int header_height = (int)s->height / 2;
+    int pip_height = header_height - margin * 2;
+    int pip_width = pip_height * 16 / 9;
+    int maximum_pip_width = (int)s->width / 2 - margin * 2;
+    if (pip_width > maximum_pip_width) {
+        pip_width = maximum_pip_width;
+        pip_height = pip_width * 9 / 16;
+    }
+    if (pip_width < 1 || pip_height < 1)
+        return 0;
+
+    fill_rect(s, 0, 0, (int)s->width, header_height, COLOUR_PANEL, 245);
+    fill_rect(s, 0, header_height - scale, (int)s->width, scale,
+              COLOUR_PANEL_EDGE, 255);
+
+    draw_pip_picture(s, video_pixels, video_stride,
+                     margin, margin, pip_width, pip_height);
+    fill_rect(s, margin - scale, margin - scale,
+              pip_width + scale * 2, scale, COLOUR_PANEL_EDGE, 255);
+    fill_rect(s, margin - scale, margin + pip_height,
+              pip_width + scale * 2, scale, COLOUR_PANEL_EDGE, 255);
+    fill_rect(s, margin - scale, margin, scale, pip_height,
+              COLOUR_PANEL_EDGE, 255);
+    fill_rect(s, margin + pip_width, margin, scale, pip_height,
+              COLOUR_PANEL_EDGE, 255);
+
+    if (current_channel < 0 ||
+        (size_t)current_channel >= playlist->count)
+        return header_height;
+
+    const iptv_channel *channel = &playlist->channels[current_channel];
+    int info_x = margin + pip_width + margin * 2;
+    int info_width = (int)s->width - info_x - margin;
+    int line = IPTV_FONT_HEIGHT * scale;
+    int heading_scale = scale > 1 ? scale - 1 : 1;
+    int heading_line = IPTV_FONT_HEIGHT * heading_scale;
+    if (info_width <= 0)
+        return header_height;
+
+    iptv_epg_programme now;
+    bool has_programme = iptv_epg_now_at(channel->tvg_id,
+                                         channel->epg_index, &now);
+    const char *channel_name =
+        has_programme && now.ordered && channel->tvg_name[0]
+            ? channel->tvg_name : channel->name;
+
+    int channel_width = text_width(channel_name, heading_scale);
+    if (channel_width > info_width * 3 / 5)
+        channel_width = info_width * 3 / 5;
+    int channel_x = info_x + info_width - channel_width;
+    draw_text_scrolling(s, SCROLL_PIP_CHANNEL,
+                        channel_x, channel_width, margin,
+                        channel_name, heading_scale,
+                        COLOUR_SELECTED, false);
+
+    if (has_programme) {
+        int title_width = channel_x - info_x - margin;
+        if (title_width > 0)
+            draw_text_scrolling(s, SCROLL_PIP_PROGRAMME,
+                                info_x, title_width, margin,
+                                now.title, heading_scale,
+                                COLOUR_TEXT, false);
+    }
+
+    const char *description =
+        has_programme && now.desc[0] ? now.desc : group_of(channel);
+    int description_y = margin + heading_line + margin;
+    int description_height = margin + pip_height - description_y;
+    int max_lines = description_height / (line + scale);
+    draw_text_wrapped(s, info_x, description_y, description, scale,
+                      COLOUR_TEXT, info_width, max_lines);
+    return header_height;
+}
+
+static void draw_guide_pip(
+    const surface *s, const uint32_t *video_pixels, unsigned video_stride,
+    const iptv_playlist *playlist, int current_channel
+) {
+    int header_height = draw_pip_header(
+        s, video_pixels, video_stride, playlist, current_channel);
+    if (header_height <= 0 || header_height >= (int)s->height)
+        return;
+
+    surface lower = {
+        s->pixels + (size_t)header_height * s->stride,
+        s->width,
+        s->height - (unsigned)header_height,
+        s->stride
+    };
+    draw_guide_layout(&lower, playlist, current_channel, true);
+}
+
 /*
  * What a schedule row says to the right of the channel name.
  *
@@ -1505,8 +1713,9 @@ static const char *schedule_row_text(const iptv_channel *channel,
  * computed and never checked against the width it has to live in is how "GUIA
  * DE CANAIS" once printed on top of "43 canais".
  */
-static void draw_schedule(
-    const surface *s, const iptv_playlist *playlist, int current_channel
+static void draw_schedule_layout(
+    const surface *s, const iptv_playlist *playlist, int current_channel,
+    bool fill_surface
 ) {
     const char *title = iptv_text(IPTV_TEXT_SCHEDULE_TITLE);
 
@@ -1532,7 +1741,7 @@ static void draw_schedule(
         line = IPTV_FONT_HEIGHT * scale;
         row_height = line + pad;
 
-        int margin = pad * 3;
+        int margin = fill_surface ? 0 : pad * 3;
         panel_x = margin;
         panel_y = margin;
         panel_w = (int)s->width - margin * 2;
@@ -1689,8 +1898,33 @@ static void draw_schedule(
                   position, scale, COLOUR_SELECTED, 0);
 }
 
+static void draw_schedule(
+    const surface *s, const iptv_playlist *playlist, int current_channel
+) {
+    draw_schedule_layout(s, playlist, current_channel, false);
+}
+
+static void draw_schedule_pip(
+    const surface *s, const uint32_t *video_pixels, unsigned video_stride,
+    const iptv_playlist *playlist, int current_channel
+) {
+    int header_height = draw_pip_header(
+        s, video_pixels, video_stride, playlist, current_channel);
+    if (header_height <= 0 || header_height >= (int)s->height)
+        return;
+
+    surface lower = {
+        s->pixels + (size_t)header_height * s->stride,
+        s->width,
+        s->height - (unsigned)header_height,
+        s->stride
+    };
+    draw_schedule_layout(&lower, playlist, current_channel, true);
+}
+
 void iptv_osd_draw(
     uint32_t *pixels,
+    const uint32_t *video_pixels,
     unsigned width,
     unsigned height,
     unsigned pitch_bytes,
@@ -1703,11 +1937,19 @@ void iptv_osd_draw(
     surface s = { pixels, width, height, pitch_bytes / 4 };
 
     if (menu == MENU_GUIDE) {
-        draw_guide(&s, playlist, current_channel);
+        if (osd_style == IPTV_OSD_STYLE_CABLE_TV_PIP && video_pixels)
+            draw_guide_pip(&s, video_pixels, pitch_bytes / 4,
+                           playlist, current_channel);
+        else
+            draw_guide(&s, playlist, current_channel);
         return;
     }
     if (menu == MENU_SCHEDULE) {
-        draw_schedule(&s, playlist, current_channel);
+        if (osd_style == IPTV_OSD_STYLE_CABLE_TV_PIP && video_pixels)
+            draw_schedule_pip(&s, video_pixels, pitch_bytes / 4,
+                              playlist, current_channel);
+        else
+            draw_schedule(&s, playlist, current_channel);
         return;
     }
 
