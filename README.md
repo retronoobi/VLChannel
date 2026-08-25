@@ -81,6 +81,11 @@ face-button names use a different convention.
 | **B** | Reload/reconnect the current channel | Tune to the selected channel |
 | **X** | Open or close the schedule | Switch to or close the schedule |
 | **Y** | Open or close the channel guide | Switch to or close the guide |
+| **LB** | Local video: next subtitle track | — |
+| **RB** | Local video: next audio track | — |
+| **LT** | Local video: back 10 seconds | — |
+| **RT** | Local video: forward 10 seconds | — |
+| **Start** | Local video: pause and resume | — |
 
 The full guide and schedule are available with the **Cable TV** OSD styles. The
 **Cable TV (PIP)** guide, schedule and video guide keep the playing channel in a
