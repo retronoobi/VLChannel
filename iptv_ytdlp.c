@@ -1,15 +1,11 @@
 #include "iptv_ytdlp.h"
-#include "iptv_ytdlp_command.h"
+#include "iptv_child.h"
 #include "iptv_log.h"
 
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#ifdef _WIN32
-#include <windows.h>
-#endif
 
 #define YT_URL_MAX  4096
 #define YT_PATH_MAX 4096
@@ -18,12 +14,6 @@
 /* The directory plus a file name, so it cannot be the same size as the
  * directory. The compiler pointed this one out too. */
 #define YT_EXE_MAX (YT_PATH_MAX + 32)
-
-/*
- * Quoting can double backslashes and adds delimiters around every argument.
- * Size for that worst case, not just for the unescaped input strings.
- */
-#define YT_CMD_MAX (YT_EXE_MAX * 4u + YT_URL_MAX * 2u + 512u)
 
 static char directory[YT_PATH_MAX] = {0};
 static char executable[YT_EXE_MAX] = {0};
@@ -50,6 +40,7 @@ static char result_audio[YT_URL_MAX];
 
 typedef struct {
     unsigned generation;
+    bool live;                    /* ask for a broadcast, not for a file */
     char url[YT_URL_MAX];
 } job;
 
@@ -95,11 +86,22 @@ static bool cookies_available(void) {
     return true;
 }
 
-static size_t strip_newline(char *s) {
-    size_t len = strlen(s);
-    while (len > 0 && (s[len - 1] == '\n' || s[len - 1] == '\r'))
-        s[--len] = '\0';
-    return len;
+/*
+ * One line out of the captured text, cut to fit.
+ *
+ * The cut is deliberate and is not a loss: what is wanted is a URL, and this
+ * buffer is already four kilobytes. Anything that overflows it is not an
+ * address yt-dlp meant to give, and the check further down - does it start with
+ * "http" - throws it out. Writing the bound rather than relying on snprintf's
+ * also lets the compiler see it, which is worth a warning nobody has to decide
+ * whether to believe.
+ */
+static void take_line(char *out, size_t out_size, const char *text) {
+    size_t length = strcspn(text, "\r\n");
+    if (length >= out_size)
+        length = out_size - 1;
+    memcpy(out, text, length);
+    out[length] = '\0';
 }
 
 static bool generation_is_current(unsigned value) {
@@ -109,185 +111,69 @@ static bool generation_is_current(unsigned value) {
     return current;
 }
 
+/* The shape iptv_child asks for. A channel change bumps the generation, and
+ * that is what turns the change into a real cancellation rather than a
+ * pthread_join() waiting on a resolver nobody is listening to. */
+static bool generation_expired(void *cookie) {
+    return !generation_is_current(*(const unsigned *)cookie);
+}
+
 /*
  * Runs yt-dlp and fills the two lines. Returns false when nothing came back.
  * Called on the worker thread only.
+ *
+ * The process itself - the pipe, the timeout, the cancellation - belongs to
+ * iptv_child. What is left here is the part that is about yt-dlp: which
+ * arguments it takes, and what its answer is supposed to look like.
  */
-static bool run_ytdlp(const char *url, const char *cookies,
+static bool run_ytdlp(const char *url, const char *format, const char *cookies,
                       unsigned work_generation, char *video, char *audio) {
     video[0] = audio[0] = '\0';
 
-#ifdef _WIN32
-    /*
-     * CreateProcess with an anonymous pipe, and CREATE_NO_WINDOW.
-     *
-     * Never popen(): on MinGW it calls AllocConsole, Windows serialises console
-     * creation across the whole process, and the render loop freezes even
-     * though this runs on a background thread. See iptv_ytdlp.h.
-     */
-    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
-    HANDLE pipe_rd = NULL, pipe_wr = NULL;
-    if (!CreatePipe(&pipe_rd, &pipe_wr, &sa, 0))
-        return false;
-    SetHandleInformation(pipe_rd, HANDLE_FLAG_INHERIT, 0);
-
-    char cmd[YT_CMD_MAX];
-    if (!iptv_ytdlp_build_windows_command(
-            cmd, sizeof(cmd), executable, IPTV_YT_FORMAT, cookies, url)) {
-        CloseHandle(pipe_wr);
-        CloseHandle(pipe_rd);
-        iptv_log("[VLChannel] yt-dlp command line is too long or invalid\n");
-        return false;
+    const char *arguments[10];
+    size_t count = 0;
+    arguments[count++] = executable;
+    arguments[count++] = "-f";
+    arguments[count++] = format;
+    if (cookies && cookies[0]) {
+        arguments[count++] = "--cookies";
+        arguments[count++] = cookies;
     }
+    arguments[count++] = "--get-url";
+    arguments[count++] = "--no-playlist";
+    arguments[count++] = "--no-warnings";
+    /* Standalone, so a playlist's text can only be read as one URL argument
+     * and never as a yt-dlp option. */
+    arguments[count++] = "--";
+    arguments[count++] = url;
 
-    STARTUPINFOA si = {0};
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-    si.hStdOutput = pipe_wr;
-    si.hStdError = pipe_wr;
-    si.hStdInput = NULL;
+    char output[YT_URL_MAX * 2];
+    unsigned checked = work_generation;
+    iptv_child_result ran =
+        iptv_child_capture(executable, arguments, count, YT_TIMEOUT_MS,
+                           generation_expired, &checked,
+                           output, sizeof(output));
 
-    PROCESS_INFORMATION pi = {0};
-    /* Supplying lpApplicationName separately removes executable-path parsing
-     * from the command line. argv[0] remains present in cmd for the child. */
-    BOOL ok = CreateProcessA(executable, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW,
-                             NULL, NULL, &si, &pi);
-    CloseHandle(pipe_wr);
-    if (!ok) {
-        CloseHandle(pipe_rd);
-        iptv_log("[VLChannel] yt-dlp could not be started (error %lu)\n",
-                 (unsigned long)GetLastError());
+    switch (ran) {
+    case IPTV_CHILD_OK:
+        break;
+    case IPTV_CHILD_CANCELLED:
         return false;
-    }
-
-    /*
-     * ReadFile on an anonymous pipe is blocking. The old implementation called
-     * it before WaitForSingleObject(), so the advertised timeout was never
-     * reached when yt-dlp produced no output. Poll the pipe and process instead:
-     * every read is limited to bytes PeekNamedPipe already proved are there.
-     * The generation check also turns a channel change into a real cancellation
-     * rather than a pthread_join() waiting for a stale resolver forever.
-     */
-    char output[YT_URL_MAX * 2] = {0};
-    size_t output_used = 0;
-    ULONGLONG deadline = GetTickCount64() + YT_TIMEOUT_MS;
-    bool timed_out = false;
-    bool cancelled = false;
-    bool pipe_failed = false;
-
-    for (;;) {
-        DWORD available = 0;
-        if (!PeekNamedPipe(pipe_rd, NULL, 0, NULL, &available, NULL)) {
-            DWORD error = GetLastError();
-            if (error != ERROR_BROKEN_PIPE)
-                pipe_failed = true;
-            available = 0;
-        }
-
-        while (available > 0) {
-            char chunk[512];
-            DWORD want = available < sizeof(chunk)
-                             ? available : (DWORD)sizeof(chunk);
-            DWORD got = 0;
-            if (!ReadFile(pipe_rd, chunk, want, &got, NULL) || got == 0) {
-                pipe_failed = true;
-                break;
-            }
-
-            size_t room = sizeof(output) - 1 - output_used;
-            size_t copy = got < room ? (size_t)got : room;
-            if (copy > 0) {
-                memcpy(output + output_used, chunk, copy);
-                output_used += copy;
-                output[output_used] = '\0';
-            }
-            available -= got;
-        }
-
-        DWORD process_state = WaitForSingleObject(pi.hProcess, 0);
-        if (process_state == WAIT_OBJECT_0) {
-            DWORD remaining = 0;
-            if (!PeekNamedPipe(pipe_rd, NULL, 0, NULL, &remaining, NULL) ||
-                remaining == 0)
-                break;
-        } else if (process_state == WAIT_FAILED) {
-            pipe_failed = true;
-            break;
-        }
-
-        if (!generation_is_current(work_generation)) {
-            cancelled = true;
-            break;
-        }
-        if (GetTickCount64() >= deadline) {
-            timed_out = true;
-            break;
-        }
-        if (pipe_failed)
-            break;
-
-        Sleep(10);
-    }
-
-    if (timed_out || cancelled || pipe_failed) {
-        TerminateProcess(pi.hProcess, 1);
-        WaitForSingleObject(pi.hProcess, 2000);
-    }
-
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-    CloseHandle(pipe_rd);
-
-    if (cancelled)
-        return false;
-    if (timed_out) {
+    case IPTV_CHILD_TIMED_OUT:
         iptv_log("[VLChannel] yt-dlp timed out after %u seconds\n",
                  YT_TIMEOUT_MS / 1000);
         return false;
-    }
-    if (pipe_failed && output_used == 0) {
+    case IPTV_CHILD_PIPE_FAILED:
         iptv_log("[VLChannel] yt-dlp output pipe failed\n");
         return false;
-    }
-
-    char *first_end = strchr(output, '\n');
-    if (first_end) {
-        *first_end = '\0';
-        snprintf(video, YT_URL_MAX, "%s", output);
-        char *second = first_end + 1;
-        char *second_end = strchr(second, '\n');
-        if (second_end)
-            *second_end = '\0';
-        snprintf(audio, YT_URL_MAX, "%s", second);
-    } else {
-        snprintf(video, YT_URL_MAX, "%s", output);
-    }
-#else
-    (void)work_generation;
-    char cmd[YT_CMD_MAX];
-    if (cookies) {
-        snprintf(cmd, sizeof(cmd),
-                 "\"%s\" -f '%s' --cookies \"%s\" --get-url --no-playlist "
-                 "--no-warnings \"%s\" 2>/dev/null",
-                 executable, IPTV_YT_FORMAT, cookies, url);
-    } else {
-        snprintf(cmd, sizeof(cmd),
-                 "\"%s\" -f '%s' --get-url --no-playlist --no-warnings "
-                 "\"%s\" 2>/dev/null",
-                 executable, IPTV_YT_FORMAT, url);
-    }
-
-    FILE *pipe = popen(cmd, "r");
-    if (!pipe)
+    default:
         return false;
-    if (!fgets(video, YT_URL_MAX, pipe)) video[0] = '\0';
-    if (!fgets(audio, YT_URL_MAX, pipe)) audio[0] = '\0';
-    pclose(pipe);
-#endif
+    }
 
-    strip_newline(video);
-    strip_newline(audio);
+    const char *first = output;
+    const char *first_end = strchr(first, '\n');
+    take_line(video, YT_URL_MAX, first);
+    take_line(audio, YT_URL_MAX, first_end ? first_end + 1 : "");
 
     /*
      * Only an address counts. yt-dlp writes its diagnostics to stderr, which on
@@ -311,13 +197,21 @@ static void *worker_main(void *argument) {
 
     char video[YT_URL_MAX];
     char audio[YT_URL_MAX];
-    bool ok = run_ytdlp(work->url, NULL, work->generation, video, audio);
+    /*
+     * Chosen once, here, and used for both attempts. Asking for a file on the
+     * first try and a broadcast on the second would make the cookies retry a
+     * different question rather than the same question asked again, and the log
+     * would then be describing two experiments as one.
+     */
+    const char *format = work->live ? IPTV_YT_LIVE_FORMAT : IPTV_YT_FORMAT;
+    bool ok = run_ytdlp(work->url, format, NULL, work->generation, video, audio);
 
     if (!ok && generation_is_current(work->generation) &&
         cookies_available()) {
         iptv_log("[VLChannel] yt-dlp did not resolve without cookies; "
                  "retrying with system/vlchannel/cookies.txt\n");
-        ok = run_ytdlp(work->url, cookies_file, work->generation, video, audio);
+        ok = run_ytdlp(work->url, format, cookies_file, work->generation,
+                       video, audio);
         if (!ok && generation_is_current(work->generation))
             iptv_log("[VLChannel] yt-dlp also failed with cookies.txt\n");
     }
@@ -346,7 +240,7 @@ static void join_previous(void) {
     }
 }
 
-void iptv_ytdlp_begin(const char *youtube_url) {
+void iptv_ytdlp_begin(const char *youtube_url, bool live) {
     iptv_ytdlp_cancel();
     join_previous();
 
@@ -368,6 +262,7 @@ void iptv_ytdlp_begin(const char *youtube_url) {
     pthread_mutex_lock(&lock);
     generation++;
     work->generation = generation;
+    work->live = live;
     snprintf(work->url, sizeof(work->url), "%s", youtube_url);
     result_video[0] = result_audio[0] = '\0';
     state = IPTV_YT_WORKING;

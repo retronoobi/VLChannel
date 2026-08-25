@@ -344,6 +344,221 @@ bool iptv_youtube_id(const char *url, char *out, size_t out_size) {
 }
 
 /*
+ * The other shape of a YouTube address: a channel's permanent live page.
+ *
+ *   https://www.youtube.com/@PicaPau/live
+ *   https://www.youtube.com/c/Name/live
+ *   https://www.youtube.com/channel/UCxxxxxxxxxxxxxxxxxxxxxx/live
+ *   https://www.youtube.com/user/Name/live
+ *
+ * It is a different kind of link from every form above, and the difference is
+ * the whole reason it needs its own function. Those forms name a video; this one
+ * names a place where a video will be, and which video that is changes without
+ * the address changing. There is no eleven character id in it to find, so
+ * iptv_youtube_id() correctly refuses it - and so does the riitube proxy, which
+ * is an id-in video-out service and has nothing here to be handed.
+ *
+ * That leaves yt-dlp, which follows the page and answers with whatever is on air
+ * at the moment it is asked. So this form is recognised only in yt-dlp mode; in
+ * the other two modes the entry stays exactly as the list wrote it, like any
+ * address this reader does not claim to understand.
+ *
+ * `out` receives the channel's label - "@PicaPau", "Name", the UC id - purely so
+ * that a list written without #EXTINF shows something better than "live", which
+ * is what the last path segment would otherwise give every single one of them.
+ *
+ * Deliberately not matched: /@Name/streams and /@Name/videos. Those are listings
+ * of many videos, and yt-dlp would answer with the first of them rather than
+ * with a live broadcast. A link that plays something is worse than a link that
+ * plays nothing, because it looks like it worked.
+ */
+bool iptv_youtube_live_channel(const char *url, char *out, size_t out_size) {
+    if (!url || !out || out_size == 0)
+        return false;
+    out[0] = '\0';
+
+    const char *after = skip_prefix_ci(url, "https://");
+    if (!after) after = skip_prefix_ci(url, "http://");
+    if (!after) after = url;
+
+    const char *host = after;
+    if (skip_prefix_ci(host, "www.")) host += 4;
+    else if (skip_prefix_ci(host, "m.")) host += 2;
+
+    const char *path = skip_prefix_ci(host, "youtube.com/");
+    if (!path)
+        path = skip_prefix_ci(host, "youtube-nocookie.com/");
+    if (!path)
+        return false;
+
+    /*
+     * The label is either a handle written straight after the slash, or the
+     * segment after one of the three older prefixes. Anything else is not a
+     * channel address and is left alone.
+     */
+    const char *label = NULL;
+    if (path[0] == '@') {
+        label = path;
+    } else {
+        static const char *prefixes[] = { "channel/", "c/", "user/" };
+        for (size_t i = 0; i < sizeof(prefixes) / sizeof(*prefixes); i++) {
+            const char *at = skip_prefix_ci(path, prefixes[i]);
+            if (at) {
+                label = at;
+                break;
+            }
+        }
+    }
+    if (!label || !label[0] || label[0] == '/')
+        return false;
+
+    /*
+     * The label runs to the next slash; after it comes "live" and then the end
+     * of the address. A trailing slash, a query or a fragment may follow -
+     * nothing else, so that /@Name/livestreams is not read as /@Name/live.
+     */
+    const char *slash = strchr(label, '/');
+    if (!slash)
+        return false;
+
+    const char *tail = skip_prefix_ci(slash + 1, "live");
+    if (!tail)
+        return false;
+    if (*tail == '/')
+        tail++;
+    if (*tail && *tail != '?' && *tail != '#')
+        return false;
+
+    size_t length = (size_t)(slash - label);
+    if (length >= out_size)
+        length = out_size - 1;
+    memcpy(out, label, length);
+    out[length] = '\0';
+    return true;
+}
+
+/* --------------------------------------------------- Streaming platforms */
+
+/*
+ * Where the host starts: after the scheme, and after a www. or m. that carries
+ * no meaning. Shared with the two YouTube recognisers above in spirit; kept
+ * separate in code because those two also want the path and this one does not.
+ */
+static const char *host_of(const char *url) {
+    const char *after = skip_prefix_ci(url, "https://");
+    if (!after) after = skip_prefix_ci(url, "http://");
+    if (!after) after = url;
+
+    if (skip_prefix_ci(after, "www.")) return after + 4;
+    if (skip_prefix_ci(after, "m.")) return after + 2;
+    return after;
+}
+
+/*
+ * The guard that keeps a channel list out of the resolvers.
+ *
+ * A path ending in one of these is a thing libVLC opens directly, and that is
+ * true no matter what host it is on. It is checked before the table rather than
+ * after, so a domain landing in the table later cannot quietly capture the
+ * manifests somebody was serving from it.
+ */
+static bool looks_like_media(const char *url) {
+    static const char *const extensions[] = {
+        ".m3u8", ".m3u", ".mpd", ".ts", ".mp4", ".mkv", ".flv", ".webm",
+        ".avi", ".mov", ".mp3", ".aac", ".ogg"
+    };
+
+    /* The path only: a query string can carry anything, including something
+     * that looks like a file name and is not one. */
+    size_t length = strcspn(url, "?#");
+    for (size_t i = 0; i < sizeof(extensions) / sizeof(*extensions); i++) {
+        size_t n = strlen(extensions[i]);
+        if (length < n)
+            continue;
+        const char *at = url + length - n;
+        size_t j = 0;
+        for (; j < n; j++) {
+            char a = at[j], b = extensions[i][j];
+            if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+            if (a != b)
+                break;
+        }
+        if (j == n)
+            return true;
+    }
+    return false;
+}
+
+/* The host is this domain, or a subdomain of it. `player.twitch.tv` counts;
+ * `twitch.tv.example.com` does not, which is the whole reason this is not a
+ * substring search. */
+static bool host_is(const char *host, const char *domain) {
+    size_t host_length = strcspn(host, "/:?#");
+    size_t domain_length = strlen(domain);
+    if (host_length < domain_length)
+        return false;
+
+    const char *at = host + host_length - domain_length;
+    for (size_t i = 0; i < domain_length; i++) {
+        char a = at[i], b = domain[i];
+        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+        if (a != b)
+            return false;
+    }
+    return host_length == domain_length || at[-1] == '.';
+}
+
+/* The path part, lower-cased comparison, ends with `suffix`. */
+static bool path_ends_with(const char *url, const char *suffix) {
+    size_t length = strcspn(url, "?#");
+    size_t n = strlen(suffix);
+    if (length < n)
+        return false;
+    const char *at = url + length - n;
+    for (size_t i = 0; i < n; i++) {
+        char a = at[i], b = suffix[i];
+        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+        if (a != b)
+            return false;
+    }
+    return true;
+}
+
+bool iptv_local_file(const char *url) {
+    if (!url || !url[0])
+        return false;
+
+    /* A list or a manifest is read as one, not played as a file. */
+    if (path_ends_with(url, ".m3u") || path_ends_with(url, ".m3u8"))
+        return false;
+
+    if (skip_prefix_ci(url, "file://"))
+        return true;
+    if (url_has_scheme(url))
+        return false;
+
+    /* No scheme left: a Windows path, a UNC path, a Unix path, or a relative
+     * entry the reader has already joined to the playlist's directory. All of
+     * them are this machine. */
+    return true;
+}
+
+bool iptv_platform_host(const char *url) {
+    if (!url || !url[0])
+        return false;
+    if (looks_like_media(url))
+        return false;
+
+    static const char *const platforms[] = { "twitch.tv", "kick.com" };
+    const char *host = host_of(url);
+    for (size_t i = 0; i < sizeof(platforms) / sizeof(*platforms); i++)
+        if (host_is(host, platforms[i]))
+            return true;
+    return false;
+}
+
+/*
  * The URL of a channel, copied onto the heap and owned by the playlist.
  *
  * Never returns NULL. Six call sites read `channel->url` without checking, and
@@ -490,6 +705,11 @@ bool iptv_playlist_load(const char *path, iptv_playlist *out) {
      */
     size_t line_number = 0;
     size_t youtube_rewritten = 0;
+    size_t youtube_live_marked = 0;
+    size_t platform_marked = 0;
+    size_t local_files = 0;
+    size_t streamlink_tags_ignored = 0;
+    bool pending_streamlink = false;
 
     char *cursor = text;
     while (*cursor) {
@@ -556,6 +776,21 @@ bool iptv_playlist_load(const char *path, iptv_playlist *out) {
                 trim_in_place(group);
                 if (group[0])
                     copy_bounded(pending_group, sizeof(pending_group), group);
+            } else if (strncmp(line, IPTV_STREAMLINK_TAG,
+                               sizeof(IPTV_STREAMLINK_TAG) - 1) == 0 &&
+                       (line[sizeof(IPTV_STREAMLINK_TAG) - 1] == '\0' ||
+                        line[sizeof(IPTV_STREAMLINK_TAG) - 1] == ':' ||
+                        line[sizeof(IPTV_STREAMLINK_TAG) - 1] == ' ')) {
+                /*
+                 * "The next address is a live page, open it with a resolver."
+                 *
+                 * The trailing character is checked so that a tag somebody
+                 * later invents by adding a suffix - #EXTSTREAMLINKQUALITY,
+                 * say - is not silently read as this one.
+                 */
+                pending_streamlink = true;
+                if (youtube_mode != IPTV_YOUTUBE_YTDLP)
+                    streamlink_tags_ignored++;
             } else if (strncmp(line, "#EXTVLCOPT:audio-desync=", 24) == 0) {
                 /*
                  * Captured as the channel's delay instead of being passed
@@ -617,7 +852,36 @@ bool iptv_playlist_load(const char *path, iptv_playlist *out) {
          * compare the log with the list would be reading two different stories.
          */
         char video_id[16];
-        if (youtube_mode != IPTV_YOUTUBE_OFF &&
+        char live_label[IPTV_NAME_MAX];
+        if (youtube_mode == IPTV_YOUTUBE_YTDLP &&
+            (pending_streamlink || iptv_platform_host(line))) {
+            /*
+             * A platform channel: Twitch, Kick, or whatever the list author
+             * marked. The address is a place rather than a stream, so a
+             * resolver has to be asked what is behind it right now.
+             *
+             * NOT is_video, and that is the whole difference between this and
+             * the two YouTube cases below. A YouTube list is a rotation - each
+             * entry ends and the next one starts, which is what makes a list of
+             * clips behave like a channel that is always on. A Twitch channel
+             * is a channel: when it goes off the air the right answer is the
+             * no-signal screen and a button to try again, exactly as for an
+             * IPTV channel whose server went away. Walking to the next entry
+             * because somebody stopped streaming would be the television
+             * changing channel by itself.
+             *
+             * Checked before the YouTube forms so that #EXTSTREAMLINK can say
+             * this about a YouTube address too. Nothing in the host table
+             * matches youtube.com, so without the tag this branch cannot take
+             * one by accident.
+             */
+            channel->url = store_url(line);
+            channel->source = IPTV_SOURCE_PLATFORM;
+            platform_marked++;
+            if (!pending_name[0] &&
+                iptv_youtube_live_channel(line, live_label, sizeof(live_label)))
+                copy_bounded(pending_name, sizeof(pending_name), live_label);
+        } else if (youtube_mode != IPTV_YOUTUBE_OFF &&
             iptv_youtube_id(line, video_id, sizeof(video_id))) {
             if (youtube_mode == IPTV_YOUTUBE_PROXY) {
                 char rewritten[640];
@@ -628,9 +892,31 @@ bool iptv_playlist_load(const char *path, iptv_playlist *out) {
                 /* yt-dlp mode: the address stays as written, and is resolved
                  * when this entry is opened. */
                 channel->url = store_url(line);
+                channel->source = IPTV_SOURCE_YOUTUBE;
             }
             channel->is_video = true;
             youtube_rewritten++;
+        } else if (youtube_mode == IPTV_YOUTUBE_YTDLP &&
+                   iptv_youtube_live_channel(line, live_label,
+                                             sizeof(live_label))) {
+            /*
+             * A channel's live page. Kept as written for the same reason every
+             * yt-dlp entry is, and only in this mode because the proxy cannot
+             * take an address with no video id in it.
+             *
+             * Marked is_video with the rest of them: what arrives is one
+             * broadcast with an end, and when it ends the list should move on
+             * rather than sit on a dead page waiting for a channel that is not
+             * coming back. The next broadcast will be a different video behind
+             * the same address, which is exactly what re-opening the entry
+             * fetches.
+             */
+            channel->url = store_url(line);
+            channel->is_video = true;
+            channel->source = IPTV_SOURCE_YOUTUBE_LIVE;
+            youtube_live_marked++;
+            if (!pending_name[0])
+                copy_bounded(pending_name, sizeof(pending_name), live_label);
         } else if (url_has_scheme(line) || path_is_absolute(line) ||
             !base_directory[0]) {
             channel->url = store_url(line);
@@ -647,6 +933,21 @@ bool iptv_playlist_load(const char *path, iptv_playlist *out) {
                         "characters and was truncated: %s\n",
                         line_number, sizeof(resolved) - 1, line);
             channel->url = store_url(resolved);
+        }
+
+        /*
+         * Decided from the stored address rather than from the line, because a
+         * relative entry only becomes a path once it has been joined to the
+         * playlist's directory - and that happens in the branch above.
+         *
+         * Only DIRECT is reconsidered. An entry a resolver claimed is not a
+         * file no matter what its address looks like.
+         */
+        if (channel->source == IPTV_SOURCE_DIRECT &&
+            iptv_local_file(channel->url)) {
+            channel->source = IPTV_SOURCE_LOCAL;
+            channel->is_video = true;
+            local_files++;
         }
 
         copy_bounded(channel->name, sizeof(channel->name), pending_name);
@@ -678,6 +979,7 @@ bool iptv_playlist_load(const char *path, iptv_playlist *out) {
         pending_option_count = 0;
         pending_audio_delay = 0;
         pending_audio_delay_set = false;
+        pending_streamlink = false;
     }
 
     free(buffer);
@@ -717,6 +1019,23 @@ bool iptv_playlist_load(const char *path, iptv_playlist *out) {
                      "address is resolved by yt-dlp when it is opened\n",
                      youtube_rewritten);
     }
+    if (youtube_live_marked)
+        iptv_log("[VLChannel] %zu YouTube channel live pages; yt-dlp resolves "
+                 "whichever broadcast is on air when each one is opened\n",
+                 youtube_live_marked);
+    if (platform_marked)
+        iptv_log("[VLChannel] %zu platform entries; streamlink is asked first "
+                 "for these, and yt-dlp if it has nothing. They behave as live "
+                 "channels: one that is off the air shows no signal rather "
+                 "than advancing the list\n", platform_marked);
+    if (local_files)
+        iptv_log("[VLChannel] %zu local files; they are videos, so they "
+                 "advance the list when they end, and they take the audio, "
+                 "subtitle and jump buttons\n", local_files);
+    if (streamlink_tags_ignored)
+        iptv_log("[VLChannel] %zu " IPTV_STREAMLINK_TAG " lines had no effect: "
+                 "the resolvers only run when Video entries is set to "
+                 "alternative\n", streamlink_tags_ignored);
     return true;
 }
 

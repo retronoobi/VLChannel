@@ -1,7 +1,9 @@
 #include "iptv_log.h"
+#include "iptv_scrub.h"
 
 #include <stdio.h>
 #include <stdarg.h>
+#include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
 
@@ -105,35 +107,75 @@ const char *iptv_log_path(void) {
     return log_file_path;
 }
 
+/*
+ * Long enough for the sentences this core writes and for anything libVLC says,
+ * which it caps at a kilobyte before handing it over. What overflows is a URL,
+ * and a URL is exactly the thing that must not be written half-scrubbed.
+ */
+#define LOG_LINE_MAX 2048
+
 void iptv_log(const char *format, ...) {
+    /*
+     * Formatted once, here, instead of twice into two streams further down.
+     *
+     * The reason is iptv_scrub: the line has to exist as a string before the
+     * viewer's address can be taken out of it, and a line written straight to a
+     * stream has never been a string. Doing it this way also removes one of the
+     * two formatting passes the old version did, so the logger is not slower
+     * for having become private.
+     */
+    char stack[LOG_LINE_MAX];
+    char *line = stack;
+    char *heap = NULL;
+
     va_list arguments;
-    pthread_mutex_lock(&log_mutex);
-    unsigned long long stamp = log_now_ms();
-
-    fprintf(stderr, "[%8llu ms] ", stamp);
     va_start(arguments, format);
-    vfprintf(stderr, format, arguments);
-    va_end(arguments);
-
-    if (!log_file) {
-        pthread_mutex_unlock(&log_mutex);
-        return;
-    }
-
-    fprintf(log_file, "[%8llu ms] ", stamp);
-    va_start(arguments, format);
-    vfprintf(log_file, format, arguments);
+    int needed = vsnprintf(stack, sizeof(stack), format, arguments);
     va_end(arguments);
 
     /*
-     * Flushed every so often rather than on every line. libVLC's echo runs to
-     * hundreds of thousands of lines in a session, and flushing each one turns
-     * the log into a disk-bound brake on the decoder threads that produce it.
-     * The record lock also makes the flush cadence exact.
+     * A line that does not fit gets one allocation. It is rare - a PlutoTV URL
+     * is three thousand characters and nothing else comes close - and the
+     * alternative is truncating precisely the lines that carry secrets, which
+     * would leave the tail of a URL in the file with no field ever scrubbed.
+     *
+     * If the allocation fails the truncated copy is used. A short log line is
+     * worth more than a logger that can fail, and it is still scrubbed.
      */
-    if (++since_flush >= 64) {
-        since_flush = 0;
-        fflush(log_file);
+    if (needed >= (int)sizeof(stack)) {
+        heap = (char *)malloc((size_t)needed + 1);
+        if (heap) {
+            va_start(arguments, format);
+            vsnprintf(heap, (size_t)needed + 1, format, arguments);
+            va_end(arguments);
+            line = heap;
+        }
+    }
+
+    iptv_scrub(line);
+
+    pthread_mutex_lock(&log_mutex);
+    unsigned long long stamp = log_now_ms();
+
+    /* "%s" and not the line itself: it is content now, and a URL with a per
+     * cent sign in it must not be read as a conversion. */
+    fprintf(stderr, "[%8llu ms] %s", stamp, line);
+
+    if (log_file) {
+        fprintf(log_file, "[%8llu ms] %s", stamp, line);
+
+        /*
+         * Flushed every so often rather than on every line. libVLC's echo runs
+         * to hundreds of thousands of lines in a session, and flushing each one
+         * turns the log into a disk-bound brake on the decoder threads that
+         * produce it. The record lock also makes the flush cadence exact.
+         */
+        if (++since_flush >= 64) {
+            since_flush = 0;
+            fflush(log_file);
+        }
     }
     pthread_mutex_unlock(&log_mutex);
+
+    free(heap);
 }

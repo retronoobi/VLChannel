@@ -74,6 +74,32 @@ void iptv_osd_channel_changed(void);          /* shows the banner */
  */
 void iptv_osd_toggle_banner(void);
 bool iptv_osd_banner_visible(void);
+
+/*
+ * A short line in the top-left corner for two and a half seconds: which audio
+ * or subtitle track was just chosen, or where a jump landed.
+ *
+ * It exists for EmuVR, which does not show RetroArch's own overlay. Without it
+ * the transport buttons would do something real and look like they had done
+ * nothing, which is the kind of thing a viewer diagnoses by pressing harder.
+ *
+ * The text arrives already written and already translated - the caller has the
+ * track name, which comes out of the file and is not this module's to invent.
+ * A second call replaces the first rather than queueing behind it: somebody
+ * cycling through five audio tracks wants to see the fifth, not the first.
+ */
+void iptv_osd_show_notice(const char *text);
+
+/*
+ * The same line, held until it is cleared rather than timed out.
+ *
+ * For pause, and so far only for pause. A paused picture is a still picture,
+ * and a still picture with nothing written on it is indistinguishable from a
+ * core that has stopped working - which is the whole reason any of these
+ * notices exist on a frontend that shows none of its own.
+ */
+void iptv_osd_hold_notice(const char *text);
+void iptv_osd_clear_notice(void);
 void iptv_osd_tick(void);                     /* once per retro_run */
 
 /*

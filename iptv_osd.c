@@ -73,6 +73,28 @@ static bool banner_text_was_busy = false;
 /* Held open by the viewer instead of by a countdown - see the d-pad below. */
 static bool banner_pinned = false;
 
+/*
+ * The corner notice: which audio or subtitle track was chosen, or where a jump
+ * landed.
+ *
+ * It exists because of where this core is used. RetroArch shows its own message
+ * for a track change; EmuVR shows none of RetroArch's overlay, so inside a
+ * headset those buttons would do something real and look like they had done
+ * nothing. Two and a half seconds is long enough to read six words and short
+ * enough to be gone before the next line of dialogue.
+ *
+ * Top left, and deliberately the one corner nothing else uses: the TV style
+ * puts its channel number top right, the Cable TV banner runs along the bottom,
+ * and the loading ring sits in the middle. A notice that overlapped any of them
+ * would be a notice that arrives exactly when the other thing matters.
+ */
+#define NOTICE_FRAMES 150
+static char notice_text[160] = {0};
+/* Frames left, or -1 for held until something clears it. Pause is the only
+ * thing that holds one: a paused picture is a still picture, and a still
+ * picture with no word on it is what a frozen core looks like. */
+static int notice_countdown = 0;
+
 /* Focus: 0 on the group column, 1 on the channel column. Only the guide has
  * two columns; the schedule is one list and leaves this alone. */
 static int focus = 1;
@@ -884,6 +906,12 @@ void iptv_osd_tick(void) {
     if (waiting)
         spin_tick++;
 
+    /* Counted down before the banner's own rules, and outside them: a notice is
+     * not the banner and must not be held open by a label still scrolling in
+     * it, nor pinned by the viewer having pressed down. */
+    if (notice_countdown > 0)
+        notice_countdown--;      /* -1 is held, and is left alone */
+
     if (banner_pinned)
         return;
 
@@ -1100,8 +1128,33 @@ int iptv_osd_key_pressed(iptv_osd_key key, const iptv_playlist *playlist) {
     return -1;
 }
 
+void iptv_osd_show_notice(const char *text) {
+    if (!text || !text[0]) {
+        notice_countdown = 0;
+        notice_text[0] = '\0';
+        return;
+    }
+    snprintf(notice_text, sizeof(notice_text), "%s", text);
+    notice_countdown = NOTICE_FRAMES;
+}
+
+void iptv_osd_hold_notice(const char *text) {
+    if (!text || !text[0]) {
+        iptv_osd_clear_notice();
+        return;
+    }
+    snprintf(notice_text, sizeof(notice_text), "%s", text);
+    notice_countdown = -1;
+}
+
+void iptv_osd_clear_notice(void) {
+    notice_countdown = 0;
+    notice_text[0] = '\0';
+}
+
 bool iptv_osd_visible(void) {
-    return menu != MENU_NONE || waiting || iptv_osd_banner_visible();
+    return menu != MENU_NONE || waiting || notice_countdown != 0 ||
+           iptv_osd_banner_visible();
 }
 
 /* ---------------------------------------------------------------- drawing */
@@ -1192,6 +1245,40 @@ static void draw_banner(
 
 static int tv_number_width(const char *number, int scale) {
     return (int)strlen(number) * TV_NUMBER_ADVANCE * scale;
+}
+
+/*
+ * The corner notice.
+ *
+ * A panel behind it rather than a shadow, because this lands on top of moving
+ * picture of every possible brightness - a subtitle track name over a snow
+ * scene is unreadable with an outline and readable on a dark bar. The same
+ * decision the banner made, at one line instead of three.
+ */
+static void draw_notice(const surface *s) {
+    if (notice_countdown == 0 || !notice_text[0])
+        return;
+
+    int scale = scale_for(s->height);
+    if (scale < 2)
+        scale = 2;
+
+    int margin = 6 * scale;
+    int pad = 3 * scale;
+    int width = text_width(notice_text, scale);
+    int height = IPTV_FONT_HEIGHT * scale;
+
+    /* Clipped to the picture rather than allowed to run off it: a very long
+     * track name on a small frame is still worth its first half. */
+    int box_w = width + pad * 2;
+    if (box_w > (int)s->width - margin * 2)
+        box_w = (int)s->width - margin * 2;
+
+    fill_rect(s, margin, margin, box_w, height + pad * 2, COLOUR_PANEL, 220);
+    fill_rect(s, margin, margin, box_w, 1 * scale, COLOUR_PANEL_EDGE, 220);
+
+    draw_text(s, margin + pad, margin + pad, notice_text, scale,
+              COLOUR_TEXT, box_w - pad * 2);
 }
 
 static void draw_tv_number_text(
@@ -1965,4 +2052,6 @@ void iptv_osd_draw(
     }
     if (waiting)
         draw_waiting(&s);
+
+    draw_notice(&s);
 }

@@ -1,0 +1,30 @@
+# Line endings
+# ============
+#
+# Everything in this repository is LF, in the repository and in the working
+# copy, on Windows as much as anywhere else. Without this file Git on Windows
+# follows core.autocrlf, which defaults to true there, and converts every text
+# file to CRLF on checkout - which is what makes GitHub Desktop warn that a file
+# "uses LF but Git is configured to convert them to CRLF".
+#
+# This is not only cosmetic. Two of the files here are read by programs that
+# care:
+#
+#   - the Makefile. GNU make under MSYS2 keeps the carriage return at the end of
+#     a recipe line and hands it to the shell, so a converted Makefile fails
+#     with errors that name a command nobody wrote;
+#   - .github/workflows/build.yml, whose `run:` blocks are shell scripts and
+#     have the same problem inside the msys2 shell.
+#
+# Settling it here rather than in each machine's git config is also what stops
+# the answer from depending on who cloned the repository.
+* text=auto eol=lf
+
+# Bytes, not text: Git must not rewrite anything inside these.
+*.dll binary
+*.exe binary
+*.zip binary
+*.png binary
+*.jpg binary
+*.bmp binary
+*.ttf binary

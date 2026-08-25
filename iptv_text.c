@@ -84,6 +84,25 @@ static const text_row rows[] = {
     { IPTV_TEXT_NO_LISTING,
       "No listing",
       "Sem programacao" },
+
+    { IPTV_TEXT_AUDIO,
+      "Audio",
+      "Audio" },
+    { IPTV_TEXT_SUBTITLES,
+      "Subtitles",
+      "Legendas" },
+    { IPTV_TEXT_SUBTITLES_OFF,
+      "off",
+      "desligadas" },
+    { IPTV_TEXT_NO_SUBTITLES,
+      "No subtitles",
+      "Sem legendas" },
+    { IPTV_TEXT_ONE_AUDIO,
+      "Only one audio track",
+      "So uma faixa de audio" },
+    { IPTV_TEXT_PAUSED,
+      "Paused",
+      "Pausado" },
 };
 
 static iptv_language current = IPTV_LANG_ENGLISH;

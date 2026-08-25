@@ -62,6 +62,30 @@ static bool append_argument(char *out, size_t out_size, size_t *used,
     }
 }
 
+bool iptv_build_windows_command(
+    char *out,
+    size_t out_size,
+    const char *const *arguments,
+    size_t count
+) {
+    if (!out || out_size == 0)
+        return false;
+    out[0] = '\0';
+
+    if (!arguments || count == 0)
+        return false;
+
+    size_t used = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (!arguments[i] ||
+            !append_argument(out, out_size, &used, arguments[i])) {
+            out[0] = '\0';
+            return false;
+        }
+    }
+    return true;
+}
+
 bool iptv_ytdlp_build_windows_command(
     char *out,
     size_t out_size,
@@ -93,12 +117,5 @@ bool iptv_ytdlp_build_windows_command(
     arguments[count++] = "--";
     arguments[count++] = url;
 
-    size_t used = 0;
-    for (size_t i = 0; i < count; i++) {
-        if (!append_argument(out, out_size, &used, arguments[i])) {
-            out[0] = '\0';
-            return false;
-        }
-    }
-    return true;
+    return iptv_build_windows_command(out, out_size, arguments, count);
 }

@@ -43,12 +43,15 @@
 #include "vlc_dynamic.h"
 #include "iptv_playlist.h"
 #include "iptv_log.h"
+#include "iptv_scrub.h"
 #include "iptv_osd.h"
 #include "iptv_text.h"
 #include "iptv_zap.h"
 #include "iptv_epg.h"
 #include "iptv_sequence.h"
 #include "iptv_ytdlp.h"
+#include "iptv_streamlink.h"
+#include "iptv_transport.h"
 #include "iptv_drift.h"
 #ifdef _WIN32
 #include <windows.h>
@@ -69,10 +72,21 @@ retro_input_state_t        input_state_cb = NULL;
 static iptv_playlist playlist = {0};
 static int current_channel = -1;
 static char playlist_path[VLCHANNEL_PATH_MAX] = {0};
-/* True only until a googlevideo URL returned by yt-dlp reaches Playing. It
- * gives an URL rejected immediately (403, expired signature, incompatible
- * request headers) one chance through the proxy instead of skipping videos. */
-static bool current_open_is_ytdlp = false;
+/*
+ * True only until an address that came from a resolver reaches Playing.
+ *
+ * A resolver succeeding proves that an address was produced, not that the CDN
+ * will serve it: a signed URL can be rejected on the spot with 403, an expired
+ * signature or the wrong request headers. This flag gives that case one chance
+ * through the proxy rather than counting it as a video that will not play.
+ *
+ * It used to be inferred from ".googlevideo.com/" appearing in the address,
+ * which was true of yt-dlp's answers and of nothing else. streamlink answers
+ * about Twitch with a ttvnw.net address, so the test would have quietly stopped
+ * being about "did this come from a resolver" and started being about "is this
+ * YouTube". It is passed in now, by the one caller that knows.
+ */
+static bool current_open_is_resolved = false;
 
 /* Set when libVLC had no audio output to shift yet; see apply_audio_delay(). */
 static bool audio_delay_pending = false;
@@ -94,6 +108,11 @@ static bool prev_left = false, prev_right = false;
 static bool prev_up = false, prev_down = false;
 static bool prev_reload = false, prev_first = false;
 static bool prev_guide = false, prev_sched = false;
+/* The transport four, edge triggered like the rest: a held button seeks ten
+ * seconds once, not ten seconds per frame. */
+static bool prev_subs = false, prev_track = false;
+static bool prev_back = false, prev_forward = false;
+static bool prev_pause = false;
 static bool runtime_options_dirty = true;
 
 /*
@@ -208,6 +227,18 @@ static void note(const char *format, ...) {
     vsnprintf(message, sizeof(message), format, arguments);
     va_end(arguments);
 
+    /*
+     * Scrubbed here as well as in iptv_log, because this line goes to two
+     * places and only one of them is ours. The frontend's own log file is
+     * RetroArch's, written by RetroArch, and it would otherwise keep a copy of
+     * everything the core just took the trouble to remove.
+     *
+     * Doing it twice costs a scan of a line that has nothing left to find, and
+     * iptv_scrub is idempotent precisely so that this can be the arrangement
+     * rather than a rule about who calls what.
+     */
+    iptv_scrub(message);
+
     iptv_log("[VLChannel] %s\n", message);
     if (frontend_log)
         frontend_log(RETRO_LOG_INFO, "[VLChannel] %s\n", message);
@@ -308,8 +339,48 @@ static void apply_osd_style(void);
 static bool apply_youtube_proxy(void);
 static bool begin_opening(int index, const char *reason);
 
-/* Mirrors the option, so the open path does not have to ask the frontend. */
-static bool youtube_mode_is_ytdlp = false;
+/*
+ * Which of the two audio alignments this entry uses.
+ *
+ * This used to be current_is_video(), and that was right for exactly as long as
+ * YouTube was the only thing in the core that was not a live channel. It is a
+ * different question from "does this end", and now that a file on disk answers
+ * yes to one and no to the other, the two have to be asked separately.
+ *
+ * The PTS clock path exists for a resolved YouTube stream: a DASH pair whose
+ * separate video and audio inputs have no relationship except the one libVLC's
+ * clock describes. A local file has neither problem - it is one container read
+ * from a disk that never stalls - and it played correctly on the live-TV
+ * reserve before it was ever called a video. So it stays there, and the two
+ * alignments that were each arrived at by measurement get nothing added to
+ * them, which was the whole point of keeping local files separate.
+ */
+static bool uses_video_clock(iptv_source source) {
+    return source == IPTV_SOURCE_YOUTUBE || source == IPTV_SOURCE_YOUTUBE_LIVE;
+}
+
+/* The current entry's kind, or DIRECT when there is no current entry - which
+ * is the value that switches every feature keyed on this one off. */
+static iptv_source current_source(void) {
+    if (current_channel < 0 || (size_t)current_channel >= playlist.count)
+        return IPTV_SOURCE_DIRECT;
+    return playlist.channels[current_channel].source;
+}
+
+static bool current_uses_video_clock(void) {
+    return current_channel >= 0 &&
+           (size_t)current_channel < playlist.count &&
+           uses_video_clock(playlist.channels[current_channel].source);
+}
+
+
+/*
+ * The option used to be mirrored here, so that the open path could ask "are we
+ * in yt-dlp mode" without going to the frontend. It is gone: the reader already
+ * refuses to mark an entry for a resolver in any other mode, so an entry whose
+ * source is not DIRECT is proof of the setting all by itself. Two places
+ * holding the same fact is one place too many for it to be held wrongly in.
+ */
 
 /* Options read on per-frame paths stay cached. Asking the frontend every
  * retro_run is not free and also makes older RetroArch versions flood the log.
@@ -997,9 +1068,15 @@ static void apply_media_options(libvlc_media_t *m, const iptv_channel *channel) 
  * something to them and the only one that will still work tomorrow.
  *
  * NULL means "use the list's own address", which is every other caller.
+ *
+ * `from_resolver` says whether `address` came from yt-dlp or streamlink, as
+ * opposed to from the proxy or from the list. Only a resolved address gets the
+ * one proxy retry when playback refuses it - the proxy retrying itself is what
+ * a loop would be made of.
  */
 static bool open_channel_from(int index, const char *reason,
-                              const char *address, const char *audio_slave) {
+                              const char *address, const char *audio_slave,
+                              bool from_resolver) {
     if (index < 0 || (size_t)index >= playlist.count)
         return false;
     if (!core.libvlc)
@@ -1007,13 +1084,12 @@ static bool open_channel_from(int index, const char *reason,
 
     const iptv_channel *channel = &playlist.channels[index];
     const char *url = (address && address[0]) ? address : channel->url;
-    bool ytdlp_url = address && address[0] &&
-                     strstr(address, ".googlevideo.com/") != NULL;
-    current_open_is_ytdlp = ytdlp_url;
-    bool previous_was_video =
+    current_open_is_resolved = from_resolver && address && address[0];
+    bool previous_used_video_clock =
         current_channel >= 0 &&
         (size_t)current_channel < playlist.count &&
-        playlist.channels[current_channel].is_video;
+        uses_video_clock(playlist.channels[current_channel].source);
+    bool uses_clock = uses_video_clock(channel->source);
 
     note("Channel %d/%zu: \"%s\"%s%s%s (%s)",
          index + 1, playlist.count, channel->name,
@@ -1103,8 +1179,8 @@ static bool open_channel_from(int index, const char *reason,
      * time can discard a much larger decode-ahead burst from the new file while
      * its video clock advances, creating a permanent offset on every transition.
      */
-    resynchronise_audio("channel change", channel->is_video ? 0 : 8);
-    if (previous_was_video != channel->is_video)
+    resynchronise_audio("channel change", uses_clock ? 0 : 8);
+    if (previous_used_video_clock != uses_clock)
         iptv_drift_reset();
 
     int open_timeout_s = atoi(option_value("vlchannel_open_timeout", "20"));
@@ -1141,10 +1217,14 @@ static bool open_channel_from(int index, const char *reason,
     if (current_channel >= 0)
         iptv_zap_trigger();
     audio_delay_pending = false;      /* belonged to the channel being left */
+    /* Both belonged to the entry being left: the jump target it accumulated,
+     * and whatever notice it put in the corner. */
+    iptv_transport_reset();
+    iptv_osd_clear_notice();
     current_channel = index;
     last_reported_state = libvlc_NothingSpecial;
 
-    if (channel->is_video) {
+    if (uses_clock) {
         if (vlchannel_libvlc_clock)
             note("YouTube audio sync uses the libVLC PTS clock");
         else
@@ -1169,32 +1249,101 @@ static bool open_channel_from(int index, const char *reason,
 
 /* The ordinary way in: the address is the one in the list. */
 static bool open_channel(int index, const char *reason) {
-    return open_channel_from(index, reason, NULL, NULL);
+    return open_channel_from(index, reason, NULL, NULL, false);
 }
 
 /*
- * An entry waiting on yt-dlp, and the reason it was opened.
+ * An entry waiting on a resolver, which one is running, and the reason it was
+ * opened.
  *
  * -1 means nothing is in flight. The reason is carried through because it is a
  * pointer to a string literal owned by whoever asked, and the message that
  * eventually appears in the log should say why the viewer ended up here, not
  * "resolved".
  */
+typedef enum {
+    RESOLVER_NONE = 0,
+    RESOLVER_YTDLP,
+    RESOLVER_STREAMLINK
+} resolver;
+
 static int resolving_channel = -1;
+static resolver resolving_with = RESOLVER_NONE;
 static const char *resolving_reason = NULL;
 static uint64_t resolving_since = 0;
 
 /*
- * Starts opening `index`, which for a yt-dlp video means asking first.
+ * Which tool is asked first, and which second.
+ *
+ * Both know about both kinds of address, so this is a preference and not a
+ * capability: yt-dlp is the better answer for a YouTube video, streamlink is
+ * the better answer for a live broadcast on a platform built around them. The
+ * loser of each pairing is still tried, because "the specialist had nothing"
+ * and "nobody has anything" are different answers and only the second one is
+ * worth giving up on.
+ */
+static resolver first_resolver(iptv_source source) {
+    return source == IPTV_SOURCE_PLATFORM ? RESOLVER_STREAMLINK
+                                          : RESOLVER_YTDLP;
+}
+
+static resolver second_resolver(iptv_source source) {
+    return source == IPTV_SOURCE_PLATFORM ? RESOLVER_YTDLP
+                                          : RESOLVER_STREAMLINK;
+}
+
+static bool resolver_available(resolver which) {
+    return which == RESOLVER_YTDLP      ? iptv_ytdlp_available()
+         : which == RESOLVER_STREAMLINK ? iptv_streamlink_available()
+                                        : false;
+}
+
+static void cancel_resolvers(void) {
+    iptv_ytdlp_cancel();
+    iptv_streamlink_cancel();
+    resolving_channel = -1;
+    resolving_with = RESOLVER_NONE;
+}
+
+/*
+ * Starts `which` on `index`, or returns false if that tool is not installed.
+ *
+ * Only one runs at a time. Running both and taking whichever answers first
+ * would be faster on a bad day and would also mean two processes per channel
+ * change on every good one, for an answer the first tool was about to give.
+ */
+static bool start_resolver(int index, resolver which) {
+    if (!resolver_available(which))
+        return false;
+
+    const iptv_channel *channel = &playlist.channels[index];
+    bool live = channel->source == IPTV_SOURCE_YOUTUBE_LIVE;
+
+    if (which == RESOLVER_YTDLP) {
+        note(live ? "Asking yt-dlp what is on air on this YouTube channel"
+                  : "Asking yt-dlp for this address");
+        iptv_ytdlp_begin(channel->url, live);
+    } else {
+        note("Asking streamlink what is on air at this address");
+        iptv_streamlink_begin(channel->url);
+    }
+
+    resolving_channel = index;
+    resolving_with = which;
+    resolving_since = monotonic_time_ms();
+    return true;
+}
+
+/*
+ * Starts opening `index`, which for a resolver entry means asking first.
  *
  * Every channel change goes through here, so the wait exists in exactly one
  * place. The banner is already up by then - it is raised by open_channel, which
- * is why a video shows its name while the address is still being fetched rather
- * than showing nothing.
+ * is why an entry shows its name while the address is still being fetched
+ * rather than showing nothing.
  */
 static bool begin_opening(int index, const char *reason) {
-    iptv_ytdlp_cancel();          /* whatever was in flight is about stale news */
-    resolving_channel = -1;
+    cancel_resolvers();           /* whatever was in flight is about stale news */
 
     if (index < 0 || (size_t)index >= playlist.count)
         return false;
@@ -1202,21 +1351,30 @@ static bool begin_opening(int index, const char *reason) {
     /* A new tune attempt replaces the terminal test pattern immediately. */
     set_no_signal(false);
 
-    bool resolve = youtube_mode_is_ytdlp &&
-                   playlist.channels[index].is_video &&
-                   iptv_ytdlp_available();
-
-    if (!resolve)
-        return open_channel(index, reason);
-
-    note("Asking yt-dlp for this video");
-    resolving_channel = index;
+    iptv_source source = playlist.channels[index].source;
     resolving_reason = reason;
-    resolving_since = monotonic_time_ms();
-    iptv_ytdlp_begin(playlist.channels[index].url);
-    /* Started, not opened. The caller has nothing to fail on yet - retro_run
-     * finishes this in a frame or two. */
-    return true;
+
+    if (source != IPTV_SOURCE_DIRECT) {
+        if (start_resolver(index, first_resolver(source)) ||
+            start_resolver(index, second_resolver(source)))
+            /* Started, not opened. The caller has nothing to fail on yet -
+             * retro_run finishes this in a frame or two. */
+            return true;
+
+        /*
+         * Neither tool is installed. Said before the failure rather than after
+         * it, because the failure is a libVLC error on a web page and reads
+         * like a dead link. A YouTube video still has the proxy after this; a
+         * channel live page and a platform address do not, so for those the
+         * missing tools are the whole of the reason.
+         */
+        if (source != IPTV_SOURCE_YOUTUBE)
+            note("This entry is a live page, and opening one needs yt-dlp or "
+                 "streamlink. Put yt-dlp.exe in system\\vlchannel, or "
+                 "streamlink in system\\vlchannel\\streamlink.");
+    }
+
+    return open_channel(index, reason);
 }
 
 static void request_channel(int index, const char *reason) {
@@ -1422,6 +1580,16 @@ RETRO_API void retro_set_environment(retro_environment_t cb) {
          *
          * Changing it reloads the list, because the rewriting happens when the
          * list is read.
+         *
+         * `alternative` is the resolvers - yt-dlp and streamlink - and it is
+         * the only value that can open an address with no video id in it: a
+         * channel's live page, or a Twitch or Kick page. The proxy takes an id
+         * and nothing else, so for those entries it is not a fallback, it is
+         * simply not applicable.
+         *
+         * The labels are left as they are, even though "alternative" now names
+         * two programs. They are what a saved core option is matched against,
+         * and renaming one would silently return everybody to the default.
          */
         { "vlchannel_video",
           "Video entries (reloads the list); proxy|alternative|disabled" },
@@ -1510,6 +1678,7 @@ void retro_init(void) {
         iptv_log("[VLChannel] Runtime directory: %s\n", runtime_directory);
         runtime_loaded = vlchannel_load_libvlc(runtime_directory);
         iptv_ytdlp_set_directory(runtime_directory);
+        iptv_streamlink_set_directory(runtime_directory);
     } else {
         iptv_log("[VLChannel] RetroArch system directory is unavailable\n");
     }
@@ -1712,6 +1881,14 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
         { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_UP,    "Guide: up" },
         { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_DOWN,  "Channel info / guide: down" },
         { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_Y,     "Schedule" },
+        /* Local files only. Declared unconditionally because the descriptors
+         * are sent once, before any content is loaded, and a list with no local
+         * file in it simply never fires them. */
+        { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L,  "Video: subtitle track" },
+        { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R,  "Video: audio track" },
+        { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L2, "Video: back 10 s" },
+        { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R2, "Video: forward 10 s" },
+        { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START, "Video: pause" },
         { 0, 0, 0, 0, NULL },
     };
     environ_cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, (void*)descriptors);
@@ -1810,6 +1987,14 @@ static void handle_input(void) {
     bool sched   = PRESSED(RETRO_DEVICE_ID_JOYPAD_Y);  /* left face, Xbox X */
     bool guide   = PRESSED(RETRO_DEVICE_ID_JOYPAD_X);  /* top face, Xbox Y */
 
+    /* The transport four. Read every frame like the rest; whether they mean
+     * anything is decided below, by what is playing. */
+    bool subs    = PRESSED(RETRO_DEVICE_ID_JOYPAD_L);   /* L1 */
+    bool track   = PRESSED(RETRO_DEVICE_ID_JOYPAD_R);   /* R1 */
+    bool back    = PRESSED(RETRO_DEVICE_ID_JOYPAD_L2);
+    bool forward = PRESSED(RETRO_DEVICE_ID_JOYPAD_R2);
+    bool pause   = PRESSED(RETRO_DEVICE_ID_JOYPAD_START);
+
     #undef PRESSED
 
     /*
@@ -1873,11 +2058,102 @@ static void handle_input(void) {
          */
         if (down && !prev_down)
             iptv_osd_toggle_banner();
+
+        /*
+         * The four that only a file on disk has.
+         *
+         * Gated on the source rather than on is_video, and the difference
+         * matters: a YouTube video ends like a file, but the address behind it
+         * expires, its audio may be a separate input, and seeking it means
+         * asking a CDN to serve a range of a signed URL. None of the four is
+         * the simple operation here that it is on a file, so none of them is
+         * offered there. A live channel has no position to seek to at all.
+         *
+         * Outside the guide only, like every other key in this branch: while a
+         * list is open the pad belongs to the list.
+         */
+        if (current_source() == IPTV_SOURCE_LOCAL && core.mp) {
+            char notice[IPTV_TRANSPORT_NOTICE_MAX];
+
+            if (subs && !prev_subs) {
+                iptv_transport_next_subtitle(core.mp, notice, sizeof(notice));
+                if (notice[0])
+                    iptv_osd_show_notice(notice);
+            }
+
+            if (track && !prev_track) {
+                /*
+                 * A resync, because libVLC tears down and rebuilds the audio
+                 * output for the new track: what is already in the ring belongs
+                 * to the old one, and playing it out would be the previous
+                 * language finishing its sentence after the new one started.
+                 */
+                if (iptv_transport_next_audio(core.mp, notice, sizeof(notice)))
+                    resynchronise_audio("audio track", 8);
+                if (notice[0])
+                    iptv_osd_show_notice(notice);
+            }
+
+            if (pause && !prev_pause) {
+                /*
+                 * The core's own pause, and deliberately not the frontend's.
+                 *
+                 * There is already a pause in this core: a watchdog notices
+                 * when retro_run stops being called, pauses libVLC, and on a
+                 * live channel reopens it afterwards to get back to live. That
+                 * one is about the frontend disappearing. This one is a viewer
+                 * stopping a film, and the two must not be confused - a film
+                 * paused for ten minutes must not come back reopened from the
+                 * start.
+                 *
+                 * They stay apart because the watchdog only acts on a player
+                 * that is Playing, and only its own path sets the flag that
+                 * makes the resume reopen anything. A deliberately paused
+                 * player is simply invisible to it.
+                 *
+                 * Nothing below this needs a paused case: every audio branch in
+                 * retro_run is already gated on core.is_playing, which a paused
+                 * player is not, so the frontend keeps getting silence and the
+                 * last frame for as long as this lasts.
+                 */
+                core.paused = !core.paused;
+                libvlc_media_player_set_pause(core.mp, core.paused ? 1 : 0);
+
+                if (core.paused) {
+                    /* Stops the sound now instead of letting the ring drain a
+                     * second and a half past the frozen picture. */
+                    vlc_audio_flush();
+                    iptv_osd_hold_notice(iptv_text(IPTV_TEXT_PAUSED));
+                    note("Paused");
+                } else {
+                    resynchronise_audio("resume from pause", 8);
+                    iptv_osd_clear_notice();
+                    note("Resumed");
+                }
+            }
+
+            if ((back && !prev_back) || (forward && !prev_forward)) {
+                int step = (back && !prev_back) ? -IPTV_TRANSPORT_STEP_SECONDS
+                                                : IPTV_TRANSPORT_STEP_SECONDS;
+                /*
+                 * Same reason, more so: after a jump the ring holds a second
+                 * and a half of where the viewer just left, and playing it
+                 * sounds exactly like a seek that did not work.
+                 */
+                if (iptv_transport_seek(core.mp, step, notice, sizeof(notice)))
+                    resynchronise_audio("seek", 8);
+                if (notice[0])
+                    iptv_osd_show_notice(notice);
+            }
+        }
     }
 
     prev_up = up; prev_down = down; prev_guide = guide; prev_sched = sched;
     prev_left = left; prev_right = right;
     prev_reload = confirm; prev_first = cancel;
+    prev_subs = subs; prev_track = track;
+    prev_back = back; prev_forward = forward;
+    prev_pause = pause;
 }
 
 /*
@@ -1994,13 +2270,13 @@ static bool apply_youtube_proxy(void) {
                                                          : IPTV_YOUTUBE_PROXY;
 
     iptv_playlist_set_youtube_mode(mode);
-    youtube_mode_is_ytdlp = (mode == IPTV_YOUTUBE_YTDLP);
 
     bool changed = previous >= 0 && previous != (int)mode;
     previous = (int)mode;
     if (changed || previous < 0)
-        note("YouTube entries: %s",
-             mode == IPTV_YOUTUBE_YTDLP ? "resolved by yt-dlp"
+        note("Video and live entries: %s",
+             mode == IPTV_YOUTUBE_YTDLP
+                 ? "resolved by yt-dlp and streamlink, with the proxy last"
            : mode == IPTV_YOUTUBE_OFF   ? "left as written"
                                         : "rewritten to the riitube proxy");
     return changed;
@@ -2213,15 +2489,26 @@ static void advance_after_video(void) {
     }
 }
 
-/* A successful yt-dlp process only proves that an address was produced. The
- * CDN can still reject that address when libVLC opens it. Retry the same item
- * through the proxy once; open_channel_from clears current_open_is_ytdlp for
- * the proxy URL, so this cannot loop. */
-static bool retry_ytdlp_with_proxy(const char *failure) {
-    if (!current_open_is_ytdlp || !current_is_video())
+/*
+ * A resolver succeeding only proves that an address was produced. The CDN can
+ * still reject it when libVLC opens it. Retry the same item through the proxy
+ * once; open_channel_from is told the proxy URL did not come from a resolver,
+ * so this cannot loop.
+ *
+ * Only a YouTube video reaches the second half of this. A channel live page and
+ * a platform address carry no video id, so the proxy has nothing it could be
+ * given - and a live broadcast that stops has usually simply ended, which is
+ * the ordinary case and not a failure worth a second attempt.
+ */
+static bool retry_resolved_with_proxy(const char *failure) {
+    if (!current_open_is_resolved || !current_is_video())
         return false;
 
-    current_open_is_ytdlp = false;
+    current_open_is_resolved = false;
+
+    if (playlist.channels[current_channel].source != IPTV_SOURCE_YOUTUBE)
+        return false;
+
     char id[16];
     if (!iptv_youtube_id(playlist.channels[current_channel].url,
                          id, sizeof(id)))
@@ -2230,10 +2517,11 @@ static bool retry_ytdlp_with_proxy(const char *failure) {
     char fallback[640];
     snprintf(fallback, sizeof(fallback), "%s%s",
              IPTV_YOUTUBE_PROXY_DEFAULT, id);
-    note("The yt-dlp URL %s before playback; retrying this video through the "
+    note("The resolved URL %s before playback; retrying this video through the "
          "proxy", failure);
-    return open_channel_from(current_channel, "yt-dlp URL failed; proxy fallback",
-                             fallback, NULL);
+    return open_channel_from(current_channel,
+                             "resolved URL failed; proxy fallback",
+                             fallback, NULL, false);
 }
 
 static void report_state_change(void) {
@@ -2256,11 +2544,11 @@ static void report_state_change(void) {
         set_no_signal(false);
         note("Playing");
         iptv_seq_playing(monotonic_time_ms());
-        current_open_is_ytdlp = false;
+        current_open_is_resolved = false;
         break;
     case libvlc_Ended:
         if (current_is_video()) {
-            if (retry_ytdlp_with_proxy("ended"))
+            if (retry_resolved_with_proxy("ended"))
                 break;
             advance_after_video();
             break;
@@ -2280,7 +2568,7 @@ static void report_state_change(void) {
          * guard applies, so a proxy that errors on everything stops after three
          * instead of walking the list. */
         if (current_is_video()) {
-            if (!retry_ytdlp_with_proxy("was rejected"))
+            if (!retry_resolved_with_proxy("was rejected"))
                 advance_after_video();
         } else {
             core.transitioning = false;
@@ -2341,50 +2629,108 @@ RETRO_API void retro_run(void) {
     }
 
     /*
-     * A resolution in flight. Polled, never waited on: yt-dlp takes one to five
-     * seconds, and a retro_run that does not return for five seconds is a
+     * A resolution in flight. Polled, never waited on: a resolver takes one to
+     * five seconds, and a retro_run that does not return for five seconds is a
      * frontend that has stopped drawing - under EmuVR, a headset that has
      * stopped drawing.
+     *
+     * Two tools can be in this position, so the poll asks the one that was
+     * started. They deliberately do not run at the same time; see
+     * start_resolver.
      */
     if (resolving_channel >= 0) {
-        switch (iptv_ytdlp_poll()) {
-        case IPTV_YT_WORKING:
-            break;
+        int index = resolving_channel;
+        const char *name = resolving_with == RESOLVER_STREAMLINK ? "streamlink"
+                                                                 : "yt-dlp";
+        bool working, done;
+        const char *resolved = NULL;
+        const char *resolved_audio = NULL;
 
-        case IPTV_YT_DONE: {
-            int index = resolving_channel;
+        if (resolving_with == RESOLVER_STREAMLINK) {
+            iptv_sl_state now = iptv_streamlink_poll();
+            working = now == IPTV_SL_WORKING;
+            done = now == IPTV_SL_DONE;
+            resolved = iptv_streamlink_url();
+        } else {
+            iptv_yt_state now = iptv_ytdlp_poll();
+            working = now == IPTV_YT_WORKING;
+            done = now == IPTV_YT_DONE;
+            resolved = iptv_ytdlp_url();
+            resolved_audio = iptv_ytdlp_audio_url();
+        }
+
+        if (working) {
+            /* Nothing to do this frame. */
+        } else if (done) {
             resolving_channel = -1;
-            note("yt-dlp resolved in %llu ms",
+            resolving_with = RESOLVER_NONE;
+            note("%s resolved in %llu ms", name,
                  (unsigned long long)(monotonic_time_ms() - resolving_since));
             open_channel_from(index, resolving_reason,
-                              iptv_ytdlp_url(), iptv_ytdlp_audio_url());
-            break;
-        }
-
-        default: {
+                              resolved, resolved_audio, true);
+        } else {
             /*
-             * No exe, no answer, or a timeout. The entry falls back to the
-             * proxy rather than failing: someone who forgot to copy one file
-             * gets a list that plays, and the log says which path was taken.
-             * The cost is that "yt-dlp mode" is not always yt-dlp, which is a
-             * smaller surprise than a list where nothing works.
+             * No answer, or a timeout. The other tool gets a turn before
+             * anything is given up on: they fail for different reasons, and a
+             * site one of them has stopped tracking is usually a site the other
+             * still handles.
              */
-            int index = resolving_channel;
+            iptv_source source = playlist.channels[index].source;
+            resolver other = (resolving_with == first_resolver(source))
+                                 ? second_resolver(source)
+                                 : RESOLVER_NONE;
+
+            note("%s did not resolve this address", name);
             resolving_channel = -1;
-            char fallback[640];
-            char id[16];
-            if (iptv_youtube_id(playlist.channels[index].url, id, sizeof(id))) {
-                snprintf(fallback, sizeof(fallback), "%s%s",
-                         IPTV_YOUTUBE_PROXY_DEFAULT, id);
-                note("yt-dlp did not resolve this video; using the proxy");
-                open_channel_from(index, resolving_reason, fallback, NULL);
-            } else {
-                note("yt-dlp did not resolve this video and it is not a "
-                     "YouTube address the proxy can take");
-                open_channel(index, resolving_reason);
+            resolving_with = RESOLVER_NONE;
+
+            if (other == RESOLVER_NONE || !start_resolver(index, other)) {
+                /*
+                 * Both tools are out of answers. A YouTube video still has the
+                 * proxy - someone who forgot to copy one file gets a list that
+                 * plays, and the log says which path was taken. The cost is
+                 * that "alternative" is not always a resolver, which is a
+                 * smaller surprise than a list where nothing works.
+                 */
+                char fallback[640];
+                char id[16];
+                if (source == IPTV_SOURCE_YOUTUBE &&
+                    iptv_youtube_id(playlist.channels[index].url,
+                                    id, sizeof(id))) {
+                    snprintf(fallback, sizeof(fallback), "%s%s",
+                             IPTV_YOUTUBE_PROXY_DEFAULT, id);
+                    note("Using the proxy for this video instead");
+                    open_channel_from(index, resolving_reason,
+                                      fallback, NULL, false);
+                } else {
+                    /*
+                     * The commonest answer here is not a fault: the channel is
+                     * simply not broadcasting. Said in those words, because
+                     * "did not resolve" sends whoever reads it looking for a
+                     * broken installation, and the address itself is still
+                     * perfectly good for the next broadcast.
+                     *
+                     * The entry is still opened, and it still fails - libVLC
+                     * cannot read a web page. That is on purpose: what happens
+                     * to an entry that will not play lives in one place, driven
+                     * by the player's own state, and it is not the same thing
+                     * for the two kinds. A YouTube video is stepped over; a
+                     * platform channel shows no signal and waits. A second copy
+                     * of that decision here would be a second thing to keep in
+                     * step with the first.
+                     */
+                    note(playlist.channels[index].source ==
+                                 IPTV_SOURCE_PLATFORM
+                             ? "Nothing is on air at this address, or no tool "
+                               "here can open it. This is a live channel, so "
+                               "it shows no signal; press the right face "
+                               "button to try again."
+                             : "Nothing is on air at this address, or no tool "
+                               "here can open it. The entry is stepped over "
+                               "and the address stays good for next time.");
+                    open_channel(index, resolving_reason);
+                }
             }
-            break;
-        }
         }
     }
 
@@ -2484,7 +2830,7 @@ RETRO_API void retro_run(void) {
             if (audio_pts_ms > 0 && player_ms > 0 && due) {
                 note("Audio queue %lld ms (player at %lld ms)",
                      (long long)queued_ms, (long long)player_ms);
-                if (current_is_video() && vlchannel_libvlc_clock)
+                if (current_uses_video_clock() && vlchannel_libvlc_clock)
                     note("YouTube PTS queue target %lld ms",
                          (long long)sync_reserve_ms);
             }
@@ -2779,7 +3125,7 @@ RETRO_API void retro_run(void) {
                  * stop hammering the server before the next one starts.
                  */
                 if (current_is_video()) {
-                    if (retry_ytdlp_with_proxy("timed out"))
+                    if (retry_resolved_with_proxy("timed out"))
                         reopened = true;
                     else
                         advance_after_video();
@@ -2923,7 +3269,8 @@ RETRO_API void retro_run(void) {
         */
         size_t sync_target_frames = prebuffer_frames;
         bool pts_target_active = false;
-        if (current_is_video() && vlchannel_libvlc_clock && pts_count > 0) {
+        if (current_uses_video_clock() && vlchannel_libvlc_clock &&
+            pts_count > 0) {
             int64_t tail_pts = pts_us +
                 ((int64_t)pts_count * 1000000LL) / AUDIO_TARGET_RATE;
             int64_t delay_us = tail_pts - libvlc_clock();
@@ -3171,7 +3518,7 @@ RETRO_API void retro_get_system_av_info(struct retro_system_av_info *info) {
 
 RETRO_API void retro_get_system_info(struct retro_system_info *i) {
     static char library_name[]    = "VLChannel";
-    static char library_version[] = "1.1";
+    static char library_version[] = "1.2";
     /* Both extensions hold the same thing: a channel list, or an HLS manifest
      * that the reader detects and opens as a single stream. */
     static char valid_extensions[] = "m3u|m3u8";
@@ -3205,7 +3552,9 @@ RETRO_API void retro_deinit(void) {
      * running when the library it will report into is gone is the shape of
      * crash that only happens on someone else's machine. */
     iptv_ytdlp_shutdown();
+    iptv_streamlink_shutdown();
     resolving_channel = -1;
+    resolving_with = RESOLVER_NONE;
 
     if (frontend_pause_thread_started) {
         pthread_mutex_lock(&frontend_pause_mutex);

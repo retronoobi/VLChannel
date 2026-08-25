@@ -59,6 +59,8 @@ extern __typeof__(&libvlc_media_player_set_pause) vlchannel_libvlc_media_player_
 extern __typeof__(&libvlc_media_player_get_state) vlchannel_libvlc_media_player_get_state;
 extern __typeof__(&libvlc_media_player_get_time) vlchannel_libvlc_media_player_get_time;
 extern __typeof__(&libvlc_media_player_get_length) vlchannel_libvlc_media_player_get_length;
+extern __typeof__(&libvlc_media_player_set_time) vlchannel_libvlc_media_player_set_time;
+extern __typeof__(&libvlc_media_player_is_seekable) vlchannel_libvlc_media_player_is_seekable;
 extern __typeof__(&libvlc_audio_set_callbacks) vlchannel_libvlc_audio_set_callbacks;
 extern __typeof__(&libvlc_audio_set_format) vlchannel_libvlc_audio_set_format;
 extern __typeof__(&libvlc_audio_get_track) vlchannel_libvlc_audio_get_track;
@@ -69,6 +71,11 @@ extern __typeof__(&libvlc_track_description_list_release) vlchannel_libvlc_track
 extern __typeof__(&libvlc_video_set_callbacks) vlchannel_libvlc_video_set_callbacks;
 extern __typeof__(&libvlc_video_set_format_callbacks) vlchannel_libvlc_video_set_format_callbacks;
 extern __typeof__(&libvlc_video_set_deinterlace) vlchannel_libvlc_video_set_deinterlace;
+/* Subtitles. libVLC renders them itself, into the same picture it already hands
+ * this core, so nothing here draws a glyph - these only choose which track. */
+extern __typeof__(&libvlc_video_get_spu) vlchannel_libvlc_video_get_spu;
+extern __typeof__(&libvlc_video_set_spu) vlchannel_libvlc_video_set_spu;
+extern __typeof__(&libvlc_video_get_spu_description) vlchannel_libvlc_video_get_spu_description;
 
 #ifndef VLC_DYNAMIC_IMPLEMENTATION
 #define libvlc_new vlchannel_libvlc_new
@@ -89,6 +96,8 @@ extern __typeof__(&libvlc_video_set_deinterlace) vlchannel_libvlc_video_set_dein
 #define libvlc_media_player_get_state vlchannel_libvlc_media_player_get_state
 #define libvlc_media_player_get_time vlchannel_libvlc_media_player_get_time
 #define libvlc_media_player_get_length vlchannel_libvlc_media_player_get_length
+#define libvlc_media_player_set_time vlchannel_libvlc_media_player_set_time
+#define libvlc_media_player_is_seekable vlchannel_libvlc_media_player_is_seekable
 #define libvlc_audio_set_callbacks vlchannel_libvlc_audio_set_callbacks
 #define libvlc_audio_set_format vlchannel_libvlc_audio_set_format
 #define libvlc_audio_get_track vlchannel_libvlc_audio_get_track
@@ -99,6 +108,9 @@ extern __typeof__(&libvlc_video_set_deinterlace) vlchannel_libvlc_video_set_dein
 #define libvlc_video_set_callbacks vlchannel_libvlc_video_set_callbacks
 #define libvlc_video_set_format_callbacks vlchannel_libvlc_video_set_format_callbacks
 #define libvlc_video_set_deinterlace vlchannel_libvlc_video_set_deinterlace
+#define libvlc_video_get_spu vlchannel_libvlc_video_get_spu
+#define libvlc_video_set_spu vlchannel_libvlc_video_set_spu
+#define libvlc_video_get_spu_description vlchannel_libvlc_video_get_spu_description
 #endif
 
 #endif

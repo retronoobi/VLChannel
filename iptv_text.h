@@ -85,6 +85,30 @@ typedef enum {
     IPTV_TEXT_SCHEDULE_TITLE,
     IPTV_TEXT_NO_LISTING,
 
+    /*
+     * The four notices a local file can put in the corner.
+     *
+     * These exist because of where this core is used. RetroArch shows its own
+     * message when a track changes; EmuVR does not show RetroArch's overlay at
+     * all, so inside a headset the button would be a button that does nothing
+     * observable. The core therefore says it itself, which means saying it in
+     * both languages like everything else on the screen.
+     *
+     * The track name is not translated and must not be: it comes out of the
+     * file, it is what the person who made the file called it, and "Portugues
+     * (Brasil)" is more use to the viewer than any word this table could put in
+     * its place.
+     */
+    IPTV_TEXT_AUDIO,
+    IPTV_TEXT_SUBTITLES,
+    /* Feminine in Portuguese, agreeing with "legendas" - which is why this is a
+     * whole string and not a shared word for "off". */
+    IPTV_TEXT_SUBTITLES_OFF,
+    IPTV_TEXT_NO_SUBTITLES,
+    IPTV_TEXT_ONE_AUDIO,
+    /* Held on screen for as long as a local video is paused. */
+    IPTV_TEXT_PAUSED,
+
     IPTV_TEXT_COUNT
 } iptv_text_id;
 

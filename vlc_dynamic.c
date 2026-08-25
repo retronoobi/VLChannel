@@ -82,6 +82,8 @@ __typeof__(&libvlc_media_player_set_pause) vlchannel_libvlc_media_player_set_pau
 __typeof__(&libvlc_media_player_get_state) vlchannel_libvlc_media_player_get_state = NULL;
 __typeof__(&libvlc_media_player_get_time) vlchannel_libvlc_media_player_get_time = NULL;
 __typeof__(&libvlc_media_player_get_length) vlchannel_libvlc_media_player_get_length = NULL;
+__typeof__(&libvlc_media_player_set_time) vlchannel_libvlc_media_player_set_time = NULL;
+__typeof__(&libvlc_media_player_is_seekable) vlchannel_libvlc_media_player_is_seekable = NULL;
 __typeof__(&libvlc_audio_set_callbacks) vlchannel_libvlc_audio_set_callbacks = NULL;
 __typeof__(&libvlc_audio_set_format) vlchannel_libvlc_audio_set_format = NULL;
 __typeof__(&libvlc_audio_get_track) vlchannel_libvlc_audio_get_track = NULL;
@@ -92,6 +94,9 @@ __typeof__(&libvlc_track_description_list_release) vlchannel_libvlc_track_descri
 __typeof__(&libvlc_video_set_callbacks) vlchannel_libvlc_video_set_callbacks = NULL;
 __typeof__(&libvlc_video_set_format_callbacks) vlchannel_libvlc_video_set_format_callbacks = NULL;
 __typeof__(&libvlc_video_set_deinterlace) vlchannel_libvlc_video_set_deinterlace = NULL;
+__typeof__(&libvlc_video_get_spu) vlchannel_libvlc_video_get_spu = NULL;
+__typeof__(&libvlc_video_set_spu) vlchannel_libvlc_video_set_spu = NULL;
+__typeof__(&libvlc_video_get_spu_description) vlchannel_libvlc_video_get_spu_description = NULL;
 
 #ifdef _WIN32
 static HMODULE libvlc_module = NULL;
@@ -301,6 +306,12 @@ bool vlchannel_load_libvlc(const char *directory) {
     LOAD_REQUIRED(libvlc_media_player_get_state);
     LOAD_REQUIRED(libvlc_media_player_get_time);
     LOAD_REQUIRED(libvlc_media_player_get_length);
+    /* Optional, all four of them: they exist in every runtime this core ships
+     * with, and a runtime that somehow lacks one should lose the ability to
+     * seek a local file rather than refuse to play a television channel. Every
+     * call site tests for NULL. */
+    LOAD_OPTIONAL(libvlc_media_player_set_time);
+    LOAD_OPTIONAL(libvlc_media_player_is_seekable);
     LOAD_REQUIRED(libvlc_audio_set_callbacks);
     LOAD_REQUIRED(libvlc_audio_set_format);
     LOAD_REQUIRED(libvlc_audio_get_track);
@@ -311,6 +322,9 @@ bool vlchannel_load_libvlc(const char *directory) {
     LOAD_REQUIRED(libvlc_video_set_callbacks);
     LOAD_REQUIRED(libvlc_video_set_format_callbacks);
     LOAD_OPTIONAL(libvlc_video_set_deinterlace);
+    LOAD_OPTIONAL(libvlc_video_get_spu);
+    LOAD_OPTIONAL(libvlc_video_set_spu);
+    LOAD_OPTIONAL(libvlc_video_get_spu_description);
 
     const char *version = vlchannel_libvlc_get_version();
     snprintf(runtime_version, sizeof(runtime_version), "%s",

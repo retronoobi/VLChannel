@@ -1,0 +1,23 @@
+# Build output
+# ============
+#
+# The Makefile puts every object in obj/ and the core beside the sources, so
+# both end up in the working copy the moment anybody runs make. None of it
+# belongs in the repository: it is rebuilt from the sources by CI on every push,
+# and a committed DLL is a binary nobody can review and everybody's diff has to
+# carry.
+obj/
+*.o
+*.d
+*.dll
+*.exe
+
+# What the workflow assembles before uploading, and what a local packaging run
+# leaves behind.
+dist/
+build/
+*.zip
+
+# Working files, not part of the core.
+_to_delete/
+*.log
