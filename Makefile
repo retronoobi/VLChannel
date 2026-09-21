@@ -1,7 +1,8 @@
 CORE_NAME := vlchannel_libretro
 CC = gcc
 
-VLC_CFLAGS := $(shell pkg-config --cflags libvlc)
+PKG_CONFIG ?= pkg-config
+VLC_CFLAGS := $(shell $(PKG_CONFIG) --cflags libvlc)
 
 CFLAGS := -O2 -fPIC -Wall -MMD -MP -I. $(VLC_CFLAGS)
 LDFLAGS := -shared -static-libgcc -static-libstdc++

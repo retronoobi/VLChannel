@@ -31,7 +31,21 @@ jobs:
 
       - name: Build core
         shell: msys2 {0}
-        run: make -B -j"$(nproc)"
+        run: |
+          set -euo pipefail
+          export PATH="/ucrt64/bin:/usr/bin:$PATH"
+          export PKG_CONFIG_LIBDIR="/ucrt64/lib/pkgconfig:/ucrt64/share/pkgconfig"
+          export PKG_CONFIG_PATH="$PKG_CONFIG_LIBDIR"
+
+          # Use the tools from the same environment as the installed VLC SDK.
+          # Fail here with package diagnostics if its development files are absent.
+          pacman -Q mingw-w64-ucrt-x86_64-vlc
+          test -f /ucrt64/include/vlc/vlc.h
+          test -f /ucrt64/lib/pkgconfig/libvlc.pc
+          /ucrt64/bin/pkg-config --modversion libvlc
+          /ucrt64/bin/pkg-config --cflags libvlc
+          /ucrt64/bin/gcc --version
+          make -B -j"$(nproc)" CC=/ucrt64/bin/gcc PKG_CONFIG=/ucrt64/bin/pkg-config
 
       - name: Verify build
         shell: msys2 {0}
