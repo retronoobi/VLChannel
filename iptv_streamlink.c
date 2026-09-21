@@ -33,6 +33,7 @@ static char result_url[SL_URL_MAX];
 
 typedef struct {
     unsigned generation;
+    unsigned height;
     char url[SL_URL_MAX];
 } job;
 
@@ -96,7 +97,7 @@ static bool generation_expired(void *cookie) {
  * succeed and return nothing at all. It is also unnecessary: streamlink already
  * turns its logger off whenever --stream-url is given.
  */
-static bool run_streamlink(const char *url, unsigned work_generation,
+static bool run_streamlink(const char *url, unsigned height, unsigned work_generation,
                            char *out) {
     out[0] = '\0';
 
@@ -105,7 +106,15 @@ static bool run_streamlink(const char *url, unsigned work_generation,
     arguments[count++] = executable;
     arguments[count++] = "--stream-url";
     arguments[count++] = "--default-stream";
-    arguments[count++] = IPTV_SL_STREAMS;
+    arguments[count++] = height ? "best,worst-unfiltered" : "best";
+    char excludes[32];
+    if (height) {
+        snprintf(excludes, sizeof(excludes), ">%up", height);
+        arguments[count++] = "--stream-sorting-excludes";
+        arguments[count++] = excludes;
+    }
+    iptv_log("[VLChannel] streamlink quality: %s; excludes: %s\n",
+             height ? "best,worst-unfiltered" : "best", height ? excludes : "none");
     arguments[count++] = "--url";
     arguments[count++] = url;
 
@@ -145,8 +154,14 @@ static bool run_streamlink(const char *url, unsigned work_generation,
         if (end)
             *end = '\0';
         strip_newline(line);
-        if (strncmp(line, "http", 4) == 0) {
-            snprintf(out, SL_URL_MAX, "%s", line);
+        if (strncmp(line, "https://", 8) == 0 ||
+            strncmp(line, "http://", 7) == 0) {
+            size_t length = strlen(line);
+            if (length >= SL_URL_MAX) {
+                iptv_log("[VLChannel] streamlink URL is too long\n");
+                return false;
+            }
+            memcpy(out, line, length + 1);
             return true;
         }
         if (line[0])
@@ -162,7 +177,7 @@ static void *worker_main(void *argument) {
     job *work = (job *)argument;
 
     char url[SL_URL_MAX];
-    bool ok = run_streamlink(work->url, work->generation, url);
+    bool ok = run_streamlink(work->url, work->height, work->generation, url);
 
     pthread_mutex_lock(&lock);
     if (work->generation == generation) {
@@ -186,7 +201,7 @@ static void join_previous(void) {
     }
 }
 
-void iptv_streamlink_begin(const char *url) {
+void iptv_streamlink_begin(const char *url, unsigned height) {
     iptv_streamlink_cancel();
     join_previous();
 
@@ -208,6 +223,7 @@ void iptv_streamlink_begin(const char *url) {
     pthread_mutex_lock(&lock);
     generation++;
     work->generation = generation;
+    work->height = height;
     snprintf(work->url, sizeof(work->url), "%s", url);
     result_url[0] = '\0';
     state = IPTV_SL_WORKING;

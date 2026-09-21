@@ -41,6 +41,7 @@ static char result_audio[YT_URL_MAX];
 typedef struct {
     unsigned generation;
     bool live;                    /* ask for a broadcast, not for a file */
+    unsigned height;              /* snapshot; options can change mid-request */
     char url[YT_URL_MAX];
 } job;
 
@@ -86,16 +87,7 @@ static bool cookies_available(void) {
     return true;
 }
 
-/*
- * One line out of the captured text, cut to fit.
- *
- * The cut is deliberate and is not a loss: what is wanted is a URL, and this
- * buffer is already four kilobytes. Anything that overflows it is not an
- * address yt-dlp meant to give, and the check further down - does it start with
- * "http" - throws it out. Writing the bound rather than relying on snprintf's
- * also lets the compiler see it, which is worth a warning nobody has to decide
- * whether to believe.
- */
+/* Copy one line. The caller rejects oversized URLs before reaching here. */
 static void take_line(char *out, size_t out_size, const char *text) {
     size_t length = strcspn(text, "\r\n");
     if (length >= out_size)
@@ -126,28 +118,31 @@ static bool generation_expired(void *cookie) {
  * iptv_child. What is left here is the part that is about yt-dlp: which
  * arguments it takes, and what its answer is supposed to look like.
  */
-static bool run_ytdlp(const char *url, const char *format, const char *cookies,
+static bool run_ytdlp(const char *url, const char *format, const char *sort,
+                      const char *cookies,
                       unsigned work_generation, char *video, char *audio) {
     video[0] = audio[0] = '\0';
 
-    const char *arguments[10];
+    const char *arguments[12];
     size_t count = 0;
     arguments[count++] = executable;
     arguments[count++] = "-f";
     arguments[count++] = format;
+    arguments[count++] = "--format-sort";
+    arguments[count++] = sort;
     if (cookies && cookies[0]) {
         arguments[count++] = "--cookies";
         arguments[count++] = cookies;
     }
     arguments[count++] = "--get-url";
     arguments[count++] = "--no-playlist";
-    arguments[count++] = "--no-warnings";
+    arguments[count++] = "--ignore-config";
     /* Standalone, so a playlist's text can only be read as one URL argument
      * and never as a yt-dlp option. */
     arguments[count++] = "--";
     arguments[count++] = url;
 
-    char output[YT_URL_MAX * 2];
+    char output[YT_URL_MAX * 8];
     unsigned checked = work_generation;
     iptv_child_result ran =
         iptv_child_capture(executable, arguments, count, YT_TIMEOUT_MS,
@@ -170,26 +165,33 @@ static bool run_ytdlp(const char *url, const char *format, const char *cookies,
         return false;
     }
 
-    const char *first = output;
-    const char *first_end = strchr(first, '\n');
-    take_line(video, YT_URL_MAX, first);
-    take_line(audio, YT_URL_MAX, first_end ? first_end + 1 : "");
-
-    /*
-     * Only an address counts. yt-dlp writes its diagnostics to stderr, which on
-     * Windows shares this pipe, so a failure can arrive as a line of prose - and
-     * a line of prose handed to libVLC becomes "unsupported protocol", which
-     * sends whoever reads the log looking in the wrong place.
-     */
-    if (strncmp(video, "http", 4) != 0) {
-        if (video[0])
-            iptv_log("[VLChannel] yt-dlp said: %.200s\n", video);
-        video[0] = audio[0] = '\0';
+    if (strlen(output) == sizeof(output) - 1) {
+        iptv_log("[VLChannel] yt-dlp output exceeded the capture buffer\n");
         return false;
     }
-    if (strncmp(audio, "http", 4) != 0)
-        audio[0] = '\0';
-    return true;
+
+    /* Windows combines stderr and stdout. Keep diagnostics visible without
+     * mistaking a warning before/between URLs for a stream address. */
+    unsigned urls = 0;
+    for (const char *line = output; *line; ) {
+        size_t length = strcspn(line, "\r\n");
+        bool is_url = strncmp(line, "https://", 8) == 0 ||
+                      strncmp(line, "http://", 7) == 0;
+        if (is_url) {
+            if (length >= YT_URL_MAX || urls >= 2) {
+                iptv_log("[VLChannel] yt-dlp returned oversized or extra URLs\n");
+                video[0] = audio[0] = '\0';
+                return false;
+            }
+            take_line(urls++ == 0 ? video : audio, YT_URL_MAX, line);
+        } else if (length) {
+            iptv_log("[VLChannel] yt-dlp said: %.*s\n",
+                     (int)(length > 200 ? 200 : length), line);
+        }
+        line += length;
+        while (*line == '\r' || *line == '\n') line++;
+    }
+    return urls > 0;
 }
 
 static void *worker_main(void *argument) {
@@ -204,13 +206,19 @@ static void *worker_main(void *argument) {
      * would then be describing two experiments as one.
      */
     const char *format = work->live ? IPTV_YT_LIVE_FORMAT : IPTV_YT_FORMAT;
-    bool ok = run_ytdlp(work->url, format, NULL, work->generation, video, audio);
+    char sort[96];
+    if (work->height)
+        snprintf(sort, sizeof(sort), "res:%u,vcodec:h264,acodec:m4a", work->height);
+    else
+        snprintf(sort, sizeof(sort), "res,vcodec:h264,acodec:m4a");
+    iptv_log("[VLChannel] yt-dlp format: %s; preference: %s\n", format, sort);
+    bool ok = run_ytdlp(work->url, format, sort, NULL, work->generation, video, audio);
 
     if (!ok && generation_is_current(work->generation) &&
         cookies_available()) {
         iptv_log("[VLChannel] yt-dlp did not resolve without cookies; "
                  "retrying with system/vlchannel/cookies.txt\n");
-        ok = run_ytdlp(work->url, format, cookies_file, work->generation,
+        ok = run_ytdlp(work->url, format, sort, cookies_file, work->generation,
                        video, audio);
         if (!ok && generation_is_current(work->generation))
             iptv_log("[VLChannel] yt-dlp also failed with cookies.txt\n");
@@ -240,7 +248,7 @@ static void join_previous(void) {
     }
 }
 
-void iptv_ytdlp_begin(const char *youtube_url, bool live) {
+void iptv_ytdlp_begin(const char *youtube_url, bool live, unsigned height) {
     iptv_ytdlp_cancel();
     join_previous();
 
@@ -263,6 +271,7 @@ void iptv_ytdlp_begin(const char *youtube_url, bool live) {
     generation++;
     work->generation = generation;
     work->live = live;
+    work->height = height;
     snprintf(work->url, sizeof(work->url), "%s", youtube_url);
     result_video[0] = result_audio[0] = '\0';
     state = IPTV_YT_WORKING;

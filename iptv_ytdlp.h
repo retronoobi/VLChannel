@@ -66,12 +66,10 @@ bool iptv_ytdlp_available(void);
  * playlist reader decided it when the entry was read, and a second guess in a
  * second place is a second thing that can disagree.
  *
- * It matters because the two cases have no format in common. A video is asked
- * for as a progressive file; a live broadcast has no progressive file at all,
- * only HLS renditions, so the ordinary selector matches nothing and yt-dlp
- * answers with a refusal instead of a URL.
+ * height is a preferred resolution (0 means best available). Select the best
+ * stream up to it, or the smallest available if all streams exceed it.
  */
-void iptv_ytdlp_begin(const char *youtube_url, bool live);
+void iptv_ytdlp_begin(const char *youtube_url, bool live, unsigned height);
 
 iptv_yt_state iptv_ytdlp_poll(void);
 
@@ -92,53 +90,10 @@ void iptv_ytdlp_cancel(void);
 /* Waits for the thread and releases everything. For retro_deinit. */
 void iptv_ytdlp_shutdown(void);
 
-/*
- * The format asked of yt-dlp, exposed so a test can assert on it rather than on
- * a copy of it.
- *
- *   1. format 18, YouTube's broadly compatible H.264/AAC progressive file;
- *   2. otherwise the best MP4 H.264/AAC progressive file up to 480p.
- *
- * This deliberately matches the selector proven by another old-PC player.
- * A DASH video+audio pair can reach 1080p, but current authenticated YouTube
- * URLs for those tracks answer libVLC's direct HTTP request with 403 even when
- * yt-dlp resolved them successfully. A progressive file is the proxy-like
- * path: one ordinary URL that libVLC can open. Format 18 is normally 360p; the
- * core's fixed 1920x1080 canvas scales that picture but does not turn the source
- * into 1080p.
- */
-#define IPTV_YT_FORMAT \
-    "18/best[height<=480][ext=mp4][vcodec^=avc1][acodec^=mp4a]"
-
-/*
- * The same request, for a broadcast that is happening now.
- *
- * A live YouTube stream is not published as a file. There is no format 18, so
- * IPTV_YT_FORMAT's first and preferred alternative can never match; what exists
- * is a set of HLS renditions, and the entry falls through to that selector's
- * second alternative - which has no fallback of its own. On a well behaved
- * broadcast that is fine and the two selectors agree. On the two that are not,
- * it resolves to nothing at all:
- *
- *   - a channel broadcasting only in 1080p, where the 480p ceiling excludes
- *     every rendition on offer;
- *   - a broadcast published as VP9 and Opus, which the avc1/mp4a constraint
- *     excludes for the same reason.
- *
- * Both end with yt-dlp refusing rather than answering, and a refusal reaches the
- * viewer as a channel that will not open for no stated reason. Hence a selector
- * of its own, which gives up the codec constraint and then the height, in that
- * order: preference first, and something playing rather than nothing.
- *
- * What comes back is one m3u8 address with both tracks already in it, so there
- * is no audio slave to pass to libVLC, and libVLC opens it exactly the way it
- * opens every other IPTV channel in this core.
- *
- * The 480p preference matches the video selector's on purpose. This core exists
- * to run on old machines and inside EmuVR, and a live broadcast is the one thing
- * that cannot be re-buffered from the start when the decoder falls behind.
- */
-#define IPTV_YT_LIVE_FORMAT \
-    "best[height<=480][vcodec^=avc1][acodec^=mp4a]/best[height<=480]/best"
+/* Video may include audio already, or require a separate audio URL. Live
+ * prefers a combined stream, with a separate-track fallback when necessary.
+ * Resolution and codec preferences are supplied through --format-sort. */
+#define IPTV_YT_FORMAT "bestvideo*+bestaudio/best"
+#define IPTV_YT_LIVE_FORMAT "best/bestvideo*+bestaudio"
 
 #endif

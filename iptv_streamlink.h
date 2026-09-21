@@ -61,7 +61,9 @@ bool iptv_streamlink_available(void);
  * abandoned, for the same reason it is in iptv_ytdlp: the viewer has moved on,
  * and an answer about the previous channel would open the wrong thing.
  */
-void iptv_streamlink_begin(const char *url);
+/* height is the preferred resolution; 0 means best. If every stream exceeds
+ * the preference, select the lowest unfiltered stream instead. */
+void iptv_streamlink_begin(const char *url, unsigned height);
 
 iptv_sl_state iptv_streamlink_poll(void);
 
@@ -73,19 +75,5 @@ void iptv_streamlink_cancel(void);
 
 /* Waits for the thread and releases everything. For retro_deinit. */
 void iptv_streamlink_shutdown(void);
-
-/*
- * What is asked for, exposed so a test can assert on it rather than on a copy.
- *
- * A comma separated list of fallbacks, tried left to right. The ceiling matches
- * the yt-dlp selectors': this core runs on old machines and inside EmuVR, and a
- * live broadcast cannot be re-buffered from the start when the decoder falls
- * behind. `best` closes the list so that a channel offering nothing under 720p
- * still plays rather than failing over a preference.
- *
- * Twitch in particular offers 1080p60 as `best`, which is exactly the stream
- * this ceiling exists to avoid choosing by accident.
- */
-#define IPTV_SL_STREAMS "480p,720p,best"
 
 #endif

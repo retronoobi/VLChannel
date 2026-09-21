@@ -1319,13 +1319,14 @@ static bool start_resolver(int index, resolver which) {
     const iptv_channel *channel = &playlist.channels[index];
     bool live = channel->source == IPTV_SOURCE_YOUTUBE_LIVE;
 
+    unsigned height = (unsigned)atoi(option_value("vlchannel_video_stream_quality", "720p"));
     if (which == RESOLVER_YTDLP) {
         note(live ? "Asking yt-dlp what is on air on this YouTube channel"
                   : "Asking yt-dlp for this address");
-        iptv_ytdlp_begin(channel->url, live);
+        iptv_ytdlp_begin(channel->url, live, height);
     } else {
         note("Asking streamlink what is on air at this address");
-        iptv_streamlink_begin(channel->url);
+        iptv_streamlink_begin(channel->url, height);
     }
 
     resolving_channel = index;
@@ -1593,6 +1594,9 @@ RETRO_API void retro_set_environment(retro_environment_t cb) {
          */
         { "vlchannel_video",
           "Video entries (reloads the list); proxy|alternative|disabled" },
+        { "vlchannel_video_stream_quality",
+          "Video stream quality (yt-dlp / streamlink, reopens channel); "
+          "720p|480p|144p|240p|360p|1080p|1440p|2160p|best" },
         { "vlchannel_log_file",
           "Write the full core log to system/vlchannel-core.log (restart core); "
           "disabled|enabled" },
@@ -2346,6 +2350,7 @@ static void apply_runtime_options(void) {
         int audio_track;
         int audio_delay;
         int network_caching;
+        unsigned youtube_height;
         bool initialised;
     } previous = {0};
 
@@ -2381,6 +2386,14 @@ static void apply_runtime_options(void) {
      */
     if (apply_youtube_proxy())
         reload_playlist("YouTube rewriting changed");
+
+    unsigned youtube_height =
+        (unsigned)atoi(option_value("vlchannel_video_stream_quality", "720p"));
+    bool quality_changed = previous.initialised &&
+                          previous.youtube_height != youtube_height;
+    previous.youtube_height = youtube_height;
+    if (quality_changed && (current_uses_video_clock() || current_source() == IPTV_SOURCE_PLATFORM))
+        request_reload("Video stream quality changed");
 
     if (!previous.initialised) {
         snprintf(previous.aspect, sizeof(previous.aspect), "%s",
@@ -3518,7 +3531,7 @@ RETRO_API void retro_get_system_av_info(struct retro_system_av_info *info) {
 
 RETRO_API void retro_get_system_info(struct retro_system_info *i) {
     static char library_name[]    = "VLChannel";
-    static char library_version[] = "1.2";
+    static char library_version[] = "1.3";
     /* Both extensions hold the same thing: a channel list, or an HLS manifest
      * that the reader detects and opens as a single stream. */
     static char valid_extensions[] = "m3u|m3u8";
